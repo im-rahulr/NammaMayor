@@ -311,27 +311,30 @@ function Command() {
     return result;
   }, [locationsByZone, locationSearch]);
 
-  // Dynamic route calculation with real OSRM engine + real Bengaluru junction waypoints
+  // Dynamic route calculation with real OSRM engine + intelligent corridor routing
   useEffect(() => {
     if (mode !== "road") return;
     let cancelled = false;
     setIsCalculating(true);
 
-    // Helper: call OSRM and parse into RouteOption
     type OsrmRoute = {
       distance: number;
       duration: number;
       geometry: { coordinates: [number, number][] };
       legs?: { summary?: string }[];
     };
-    const osrmFetch = async (coords: { lat: number; lng: number }[]): Promise<OsrmRoute | null> => {
+
+    const osrmFetch = async (
+      coords: { lat: number; lng: number }[],
+      alternatives = false,
+    ): Promise<OsrmRoute[]> => {
       const coordStr = coords.map((c) => `${c.lng},${c.lat}`).join(";");
-      const url = `https://router.project-osrm.org/route/v1/driving/${coordStr}?overview=full&geometries=geojson`;
+      const url = `https://router.project-osrm.org/route/v1/driving/${coordStr}?overview=full&geometries=geojson${alternatives ? "&alternatives=3" : ""}`;
       try {
         const res = await fetch(url).then((r) => r.json());
-        return (res as { routes?: OsrmRoute[] }).routes?.[0] ?? null;
+        return (res as { routes?: OsrmRoute[] }).routes ?? [];
       } catch {
-        return null;
+        return [];
       }
     };
 
@@ -339,30 +342,25 @@ function Command() {
       rt: OsrmRoute,
       id: string,
       label: string,
-      viaName?: string,
+      fallbackVia?: string,
     ): RouteOption => ({
       id,
       label,
       coords: rt.geometry.coordinates.map((c) => [c[1], c[0]]) as [number, number][],
       distanceKm: +(rt.distance / 1000).toFixed(1),
       durationMin: +(rt.duration / 60).toFixed(1),
-      // Prefer OSRM leg summary (real road name), fall back to provided viaName
-      via: rt.legs?.[0]?.summary?.trim() || viaName || "City Corridor",
+      via: rt.legs?.[0]?.summary?.trim() || fallbackVia || "Arterial Corridor",
     });
 
     (async () => {
       try {
-        // 1. Fetch direct route + OSRM alternatives
-        const directRes = await fetch(
-          `https://router.project-osrm.org/route/v1/driving/${origin.lng},${origin.lat};${destination.lng},${destination.lat}?overview=full&geometries=geojson&alternatives=true`,
-        ).then((r) => r.json());
+        // 1. Fetch real direct driving routes from OSRM with alternatives
+        const directRoutes = await osrmFetch([origin, destination], true);
         if (cancelled) return;
+        if (!directRoutes.length) throw new Error("No route found");
 
-        const osrmRoutes: OsrmRoute[] = (directRes as { routes?: OsrmRoute[] }).routes ?? [];
-        if (!osrmRoutes.length) throw new Error("No route found");
-
-        const parsedDirect: RouteOption[] = osrmRoutes.map((rt, idx) =>
-          parseRoute(rt, `direct_${idx}`, idx === 0 ? "Direct Route" : `Alternative ${idx + 1}`),
+        const parsedDirect: RouteOption[] = directRoutes.map((rt, idx) =>
+          parseRoute(rt, `direct_${idx}`, idx === 0 ? "Fastest Route" : `Alternative ${idx + 1}`),
         );
 
         const base = parsedDirect[0]!;
@@ -374,46 +372,65 @@ function Command() {
           return;
         }
 
-        // 2. Check how many OSRM routes actually pass through the closure
-        const isBlocked = minDistanceToRoute(closurePoint, base.coords) < 400;
+        // 2. Road blockage check using 140m threshold (targeted to actual road width)
+        const isRouteBlocked = (coords: [number, number][]) =>
+          minDistanceToRoute(closurePoint, coords) < 140;
 
-        const validDirectAlts = parsedDirect.filter(
-          (r, idx) => idx > 0 && minDistanceToRoute(closurePoint, r.coords) >= 400,
-        );
+        const baseIsBlocked = isRouteBlocked(base.coords);
 
-        // 3. Build bypass candidates using REAL Bengaluru junctions near the closure.
-        //    Sort all city locations by distance from the closure, pick the 6 nearest
-        //    that are NOT too close (avoid the blocked area itself) and try routing
-        //    origin → junction → destination via OSRM.
-        const sortedLocs = [...CITY_LOCATIONS]
-          .map((loc) => ({
-            loc,
-            distM: Math.hypot(loc.lat - closurePoint.lat, loc.lng - closurePoint.lng) * 111000,
-          }))
-          .filter(({ distM }) => distM > 400 && distM < 8000) // ring: 400m–8km from closure
-          .sort((a, b) => a.distM - b.distM)
-          .slice(0, 8); // try up to 8 real junctions
+        // If the direct fastest route is NOT on the closed segment, keep direct routes as primary!
+        if (!baseIsBlocked) {
+          // Filter out any alternative that hits the closure
+          const cleanDirect = parsedDirect.filter((r) => !isRouteBlocked(r.coords));
+          setRoutes(cleanDirect.length ? cleanDirect : [base]);
+          setIsCalculating(false);
+          return;
+        }
 
-        const bypassPromises = sortedLocs.map(async ({ loc }, i) => {
-          const rt = await osrmFetch([origin, loc, destination]);
+        // 3. Primary route IS blocked: find real alternatives avoiding the closure
+        const unblockedAlts = parsedDirect.filter((r, idx) => idx > 0 && !isRouteBlocked(r.coords));
+
+        // Find key city arterial junctions for detours (only corridors with reasonable distance ratio)
+        const originDist = (loc: CityLocation) =>
+          Math.hypot(loc.lat - origin.lat, loc.lng - origin.lng);
+        const destDist = (loc: CityLocation) =>
+          Math.hypot(loc.lat - destination.lat, loc.lng - destination.lng);
+        const directDist = Math.hypot(destination.lat - origin.lat, destination.lng - origin.lng);
+
+        const candidateCorridors = CITY_LOCATIONS.filter((loc) => {
+          if (loc.id === origin.id || loc.id === destination.id) return false;
+          const distToClosureM =
+            Math.hypot(loc.lat - closurePoint.lat, loc.lng - closurePoint.lng) * 111000;
+          if (distToClosureM < 350) return false;
+          const ratio = (originDist(loc) + destDist(loc)) / (directDist || 0.01);
+          return ratio < 1.65;
+        })
+          .sort((a, b) => {
+            const ratioA = (originDist(a) + destDist(a)) / (directDist || 0.01);
+            const ratioB = (originDist(b) + destDist(b)) / (directDist || 0.01);
+            return ratioA - ratioB;
+          })
+          .slice(0, 5);
+
+        const bypassPromises = candidateCorridors.map(async (loc, i) => {
+          const rts = await osrmFetch([origin, loc, destination]);
+          const rt = rts[0];
           if (!rt) return null;
           const shortName = (loc.name.split("(")[0] ?? loc.name).trim();
           const route = parseRoute(
             rt,
-            `bypass_${i}`,
+            `detour_${i}`,
             `Detour via ${shortName}`,
             `via ${shortName}`,
           );
-          // Reject if this route still passes too close to the closure
-          if (minDistanceToRoute(closurePoint, route.coords) < 350) return null;
+          if (isRouteBlocked(route.coords)) return null;
           return route;
         });
 
         const bypassResults = (await Promise.all(bypassPromises)).filter(Boolean) as RouteOption[];
         if (cancelled) return;
 
-        // 4. Merge, de-dup by time+distance, keep top 3
-        const combined = [...validDirectAlts, ...bypassResults];
+        const combined = [...unblockedAlts, ...bypassResults];
         combined.sort((a, b) => a.durationMin - b.durationMin);
 
         const unique: RouteOption[] = [];
@@ -421,16 +438,14 @@ function Command() {
           if (
             !unique.some(
               (u) =>
-                Math.abs(u.durationMin - rt.durationMin) < 1.0 &&
-                Math.abs(u.distanceKm - rt.distanceKm) < 1.2,
+                Math.abs(u.durationMin - rt.durationMin) < 0.8 &&
+                Math.abs(u.distanceKm - rt.distanceKm) < 1.0,
             )
           ) {
             unique.push(rt);
           }
           if (unique.length >= 3) break;
         }
-
-        if (!isBlocked) unique.unshift(base);
 
         setRoutes(unique.length ? unique : parsedDirect);
       } catch {
@@ -440,7 +455,7 @@ function Command() {
         ).toFixed(1);
         const fb: RouteOption = {
           id: "fb_1",
-          label: "Arterial Connection",
+          label: "Direct Corridor",
           coords: [
             [origin.lat, origin.lng],
             [destination.lat, destination.lng],
@@ -500,7 +515,7 @@ function Command() {
         })
         .setView([12.935, 77.635], 13);
 
-      // OpenStreetMap standard tiles — free, no API key required
+      // OpenStreetMap standard tiles — free, no API key, dark look via CSS filter in styles.css
       lf.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
         attribution:
           '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors · BBMP road width &amp; UPHC',
@@ -689,30 +704,31 @@ function Command() {
     // 1. Draw alternative routes (unselected ones first, behind)
     routes.forEach((rt, idx) => {
       if (idx === activeAltIndex) return;
-      const isAlt1 = idx === 1;
-      const col = isAlt1 ? "#06b6d4" : "#f59e0b";
-      lf.polyline(rt.coords, {
-        color: col,
-        weight: 4,
-        opacity: 0.7,
-        dashArray: "6 4",
-      })
+      const col = "#64748b"; // muted slate gray for clean contrast
+      const line = lf
+        .polyline(rt.coords, {
+          color: col,
+          weight: 4,
+          opacity: 0.6,
+          dashArray: "5 5",
+        })
         .addTo(cl)
         .bindTooltip(
-          `Alt ${idx + 1} · ${rt.durationMin.toFixed(1)} min · ${rt.distanceKm.toFixed(1)} km`,
+          `Alt ${idx + 1} (${rt.via}) · ${rt.durationMin.toFixed(1)} min · ${rt.distanceKm.toFixed(1)} km`,
         );
+      line.on("click", () => setActiveAltIndex(idx));
     });
 
-    // 2. Draw active/selected route (on top)
+    // 2. Draw active/selected route (Electric Blue navigation color — no green)
     const activeRoute = routes[activeAltIndex] ?? routes[0];
     if (activeRoute) {
       const isPrimary = activeAltIndex === 0;
-      const col = isPrimary ? "#22c55e" : activeAltIndex === 1 ? "#06b6d4" : "#f59e0b";
+      const col = "#2563eb"; // Electric Blue navigation color
       // Outer glow
       lf.polyline(activeRoute.coords, {
-        color: col,
-        weight: 10,
-        opacity: 0.25,
+        color: "#3b82f6",
+        weight: 12,
+        opacity: 0.35,
         interactive: false,
       }).addTo(cl);
       // Main line
@@ -763,24 +779,24 @@ function Command() {
         push("MOBILITY", `Closure dragged to: ${near.name} Road. Recomputing routes...`, "warn");
       });
 
-      // Red hazard circle around closure
+      // Red hazard circle around closure (150m road segment radius)
       lf.circle([closurePoint.lat, closurePoint.lng], {
-        radius: 250,
+        radius: 150,
         color: "#ef4444",
         fillColor: "#ef4444",
-        fillOpacity: 0.15,
+        fillOpacity: 0.18,
         weight: 2,
         dashArray: "4 4",
       }).addTo(cl);
     }
 
-    // 4. Origin Marker (🏁 START)
+    // 4. Origin Marker (🏁 START — Slate Navy & White)
     const startMarker = lf
       .marker([origin.lat, origin.lng], {
         draggable: true,
         icon: lf.divIcon({
           className: "",
-          html: `<div class="flex h-9 w-9 items-center justify-center rounded-full bg-emerald-600 border-2 border-white text-base font-bold text-white shadow-2xl ring-4 ring-emerald-500/30 cursor-grab active:cursor-grabbing">🏁</div>`,
+          html: `<div class="flex h-9 w-9 items-center justify-center rounded-full bg-slate-900 border-2 border-white text-base font-bold text-white shadow-2xl ring-4 ring-slate-500/40 cursor-grab active:cursor-grabbing">🏁</div>`,
           iconSize: [36, 36],
           iconAnchor: [18, 18],
         }),
@@ -1569,7 +1585,7 @@ function Command() {
                     <span>COMPUTED ROUTES ({routes.length})</span>
                     {isCalculating && <span className="text-accent animate-pulse">Routing…</span>}
                     {!isCalculating && bestRoute && baselineRoute && closurePoint && (
-                      <span className="text-success font-bold">
+                      <span className="text-amber-400 font-bold">
                         +{Math.max(0, bestRoute.durationMin - baselineRoute.durationMin).toFixed(1)}
                         m delay
                       </span>
@@ -1583,13 +1599,13 @@ function Command() {
                       ? Math.max(0, rt.durationMin - baselineRoute.durationMin)
                       : 0;
                     const badgeCol = isPrimary
-                      ? "border-success bg-success/15 text-success"
+                      ? "border-blue-500 bg-blue-500/15 text-blue-400 font-bold"
                       : idx === 1
                         ? "border-cyan-500 bg-cyan-500/15 text-cyan-400"
                         : "border-amber-500 bg-amber-500/15 text-amber-400";
                     const borderCol = isSelected
                       ? isPrimary
-                        ? "border-success"
+                        ? "border-blue-500 ring-1 ring-blue-500/40"
                         : idx === 1
                           ? "border-cyan-500"
                           : "border-amber-500"
@@ -1627,7 +1643,7 @@ function Command() {
                             <span>Normal: {baselineRoute.durationMin.toFixed(1)}m</span>
                             <span
                               className={
-                                added > 0 ? "text-primary font-bold" : "text-success font-bold"
+                                added > 0 ? "text-amber-400 font-bold" : "text-sky-400 font-bold"
                               }
                             >
                               {added > 0 ? `+${added.toFixed(1)} min delay` : "Direct corridor"}
