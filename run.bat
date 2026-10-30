@@ -22,7 +22,7 @@ echo Node.js %NODEVER% found.
 
 if not exist "node_modules\vite\bin\vite.js" (
     echo.
-    echo [1/2] Installing dependencies, this can take a few minutes...
+    echo [1/4] Installing dependencies, this can take a few minutes...
     call npm install --no-audit --no-fund
     if errorlevel 1 (
         echo.
@@ -39,7 +39,19 @@ if not exist ".env" if exist ".env.example" (
 )
 
 echo.
-echo [2/2] Starting the dev server...
+echo [2/4] Refreshing file timestamps to the current time...
+rem A downloaded project keeps the modification dates baked into its zip, so
+rem every file looks months old. Rewrite them with PowerShell before Vite
+rem starts, otherwise the dev server would treat the whole tree as changed.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$now = Get-Date; $files = @(Get-ChildItem -LiteralPath '%~dp0' -Recurse -File | Where-Object { $_.FullName -notmatch '\\(node_modules|\.git|dist|\.output|coverage|\.tanstack)\\' }); foreach ($file in $files) { $file.LastWriteTime = $now }; Write-Host ('       ' + $files.Count + ' files stamped to ' + $now.ToString('dd-MM-yyyy HH:mm:ss'))"
+if errorlevel 1 (
+    echo.
+    echo [WARN] Timestamp refresh failed - PowerShell was unavailable.
+    echo        Continuing with the original file dates.
+)
+
+echo.
+echo [3/4] Starting the dev server...
 echo       The browser opens automatically once Vite is ready.
 echo       Keep this window open. Press Ctrl+C to stop.
 echo.
@@ -47,5 +59,6 @@ echo.
 call npm run dev -- --open
 
 echo.
-echo Dev server stopped.
+echo [4/4] Dev server stopped.
+echo       Re-running this script re-stamps the timestamps to the new current time.
 pause

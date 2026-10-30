@@ -4,10 +4,12 @@ import { getNews } from "@/lib/news";
 import {
   askQuestion,
   agentChat,
+  supervisorReport,
   DEFAULT_QUESTION,
   AGENT_TURN_ORDER,
   type QuestionResult,
   type AgentMessage,
+  type SupervisorReport,
 } from "@/lib/nvidia";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import type { NewsItem } from "@/lib/news-rss";
@@ -48,6 +50,17 @@ type Props = {
 };
 
 const now = () => new Date().toLocaleTimeString("en-GB", { hour12: false });
+
+// The server-side agents only need the incident facts, not the map/UI metadata.
+const toEventInput = (ev: MarkedEventInfo) => ({
+  type: ev.type,
+  typeName: ev.typeName,
+  locationName: ev.locationName,
+  lat: ev.lat,
+  lng: ev.lng,
+  severity: ev.severity,
+  description: ev.description,
+});
 
 // Agent colour map — kept in sync with AgentId in nvidia.ts
 const AGENT_COLORS: Record<string, string> = {
@@ -117,6 +130,23 @@ function Panel({
       </header>
       <div className="min-h-0 flex-1 overflow-y-auto p-4 font-mono text-xs">{children}</div>
     </section>
+  );
+}
+
+function ReportList({ title, tone, items }: { title: string; tone: string; items: string[] }) {
+  if (!items.length) return null;
+  return (
+    <div className="mt-2">
+      <div className={`text-[9px] font-bold uppercase tracking-[0.2em] ${tone}`}>{title}</div>
+      <ul className="mt-1 space-y-1">
+        {items.map((item, k) => (
+          <li key={k} className="flex gap-1.5 text-[10px] leading-relaxed">
+            <span className={tone}>▸</span>
+            <span className="text-muted-foreground">{item}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
   );
 }
 
@@ -324,6 +354,15 @@ export function CommandPanels({
   const chatEnd = useRef<HTMLDivElement>(null);
   const [cctvOpen, setCctvOpen] = useState(false);
   const [agentError, setAgentError] = useState<string | null>(null);
+  // Supervisor incident report, issued after a full 5-agent cycle.
+  const [report, setReport] = useState<SupervisorReport | null>(null);
+  const [reportBusy, setReportBusy] = useState(false);
+  // Mirror of `msgs` so the burst can read the finished thread without
+  // re-creating its callbacks on every incoming message.
+  const threadRef = useRef<AgentMessage[]>([]);
+  useEffect(() => {
+    threadRef.current = msgs;
+  }, [msgs]);
   const pausedRef = useRef(paused);
   pausedRef.current = paused;
   const modeRef = useRef(mode);
@@ -396,17 +435,7 @@ export function CommandPanels({
             turnIndex: turnIndexRef.current,
             lastMessage: lastMsgRef.current,
             mode: modeRef.current,
-            markedEvent: ev
-              ? {
-                  type: ev.type,
-                  typeName: ev.typeName,
-                  locationName: ev.locationName,
-                  lat: ev.lat,
-                  lng: ev.lng,
-                  severity: ev.severity,
-                  description: ev.description,
-                }
-              : null,
+            markedEvent: ev ? toEventInput(ev) : null,
           },
         });
         if (eventIdAtStart !== activeEventIdRef.current) return;
@@ -463,16 +492,70 @@ export function CommandPanels({
     return next;
   }, []);
 
+  // The supervisor reads the completed thread and pins an incident report in the
+  // MONITOR AI panel. Stale replies (event cleared or replaced mid-call) drop.
+  const runSupervisorReport = useCallback(async (eventId: string) => {
+    const ev = markedEventRef.current;
+    if (!ev || ev.id !== eventId) return;
+    setReportBusy(true);
+    try {
+      const result = await supervisorReport({
+        data: {
+          markedEvent: toEventInput(ev),
+          mode: modeRef.current,
+          messages: threadRef.current.map((m) => ({
+            from: m.from,
+            to: m.to,
+            text: m.text,
+          })),
+        },
+      });
+      if (activeEventIdRef.current !== eventId) return;
+      if (result.notice) notifyAiIssue(result.notice, { cooldownMs: 60_000 });
+      setReport(result);
+      setLogs((l) =>
+        [
+          {
+            t: result.t,
+            level: "OK" as const,
+            text: `SUPERVISOR REPORT ISSUED · ${result.headline} · ${result.latencyMs} ms`,
+          },
+          ...l,
+        ].slice(0, 80),
+      );
+    } catch (err) {
+      if (activeEventIdRef.current !== eventId) return;
+      const msg = err instanceof Error ? err.message : "Supervisor report error";
+      notifyAiIssue(err, { cooldownMs: 60_000 });
+      setLogs((l) =>
+        [
+          {
+            t: now(),
+            level: "WARN" as const,
+            text: `Supervisor report failed: ${msg.slice(0, 80)}`,
+          },
+          ...l,
+        ].slice(0, 80),
+      );
+    } finally {
+      if (activeEventIdRef.current === eventId) setReportBusy(false);
+    }
+  }, []);
+
   // Background cadence: one turn per tick, skipped while an incident burst runs.
   const fireTurn = useCallback(async () => {
     if (pausedRef.current || burstRef.current || queuedRef.current) return;
     queuedRef.current = true;
     try {
       await runTurn();
+      const eventId = activeEventIdRef.current;
+      // turnIndex wrapped back to 0, so a full cycle just closed on the open
+      // incident — let the supervisor re-issue its brief against the new thread.
+      if (eventId && turnIndexRef.current === 0) await runSupervisorReport(eventId);
     } finally {
       queuedRef.current = false;
     }
-  }, [runTurn]);
+  }, [runTurn, runSupervisorReport]);
 
   // A marked event opens a fresh thread and runs one full 5-agent cycle
   // immediately, so the collision is on screen the moment it is reported.
@@ -489,17 +572,20 @@ export function CommandPanels({
           if (activeEventIdRef.current !== eventId) break;
           await new Promise((resolve) => setTimeout(resolve, 500));
         }
+        if (activeEventIdRef.current === eventId) await runSupervisorReport(eventId);
       } finally {
         if (burstRef.current === token) burstRef.current = 0;
       }
     },
-    [runTurn],
+    [runTurn, runSupervisorReport],
   );
 
   // When markedEvent updates, reset the thread and respond to it immediately.
   useEffect(() => {
     if (!markedEvent) {
       activeEventIdRef.current = null;
+      setReport(null);
+      setReportBusy(false);
       return;
     }
     if (activeEventIdRef.current === markedEvent.id) return;
@@ -507,6 +593,8 @@ export function CommandPanels({
     activeEventIdRef.current = markedEvent.id;
     setPaused(false);
     pausedRef.current = false;
+    setReport(null);
+    setReportBusy(false);
 
     // Seed the thread instantly with the incident's opening line so the very
     // first chat bubble already describes the collision (shown in red), then
@@ -917,6 +1005,49 @@ export function CommandPanels({
               <div className="text-muted-foreground">HEALTH</div>
               <div className="text-lg font-bold text-success">{Math.max(80, 100 - warns)}%</div>
             </div>
+          </div>
+          <div className="max-h-[55%] min-h-0 shrink-0 overflow-y-auto border-b p-3">
+            {report ? (
+              <article className="rounded-sm border border-accent/60 bg-accent/5 p-3">
+                <div className="flex items-baseline justify-between text-[9px] font-bold uppercase tracking-[0.2em] text-accent">
+                  <span>◈ Incident Report</span>
+                  <span className="text-muted-foreground">{report.t}</span>
+                </div>
+                <h3 className="mt-2 text-[11px] leading-tight">{report.headline}</h3>
+                <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground">
+                  {report.situation}
+                </p>
+                <ReportList
+                  title="Authorised actions"
+                  tone="text-success"
+                  items={report.authorisedActions}
+                />
+                <ReportList
+                  title="Unresolved risks"
+                  tone="text-primary"
+                  items={report.unresolvedRisks}
+                />
+                <div className="mt-2 border-t pt-2 text-[10px] leading-relaxed">
+                  <span className="font-bold uppercase tracking-[0.2em] text-accent">
+                    Supervisor:
+                  </span>{" "}
+                  {report.verdict}
+                </div>
+                {reportBusy && (
+                  <div className="mt-1.5 text-[9px] tracking-widest text-muted-foreground">
+                    ⟳ Supervisor revalidating the agent thread…
+                  </div>
+                )}
+              </article>
+            ) : reportBusy ? (
+              <div className="text-[10px] leading-relaxed tracking-widest text-muted-foreground">
+                ⟳ COMPILING INCIDENT REPORT — supervisor is validating the 5-agent consensus…
+              </div>
+            ) : (
+              <div className="text-[10px] leading-relaxed tracking-widest text-muted-foreground">
+                REPORT: ISSUED BY THE SUPERVISOR ONCE ALL 5 AGENTS HAVE REPLIED TO AN INCIDENT.
+              </div>
+            )}
           </div>
           <div className="flex-1 space-y-1 overflow-y-auto p-3 font-mono text-[11px]">
             {logs.map((l, k) => (

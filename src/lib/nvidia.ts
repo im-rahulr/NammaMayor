@@ -20,7 +20,7 @@ import {
 const DEFAULT_BASE_URL = "https://integrate.api.nvidia.com/v1";
 const DEFAULT_MODEL = "nvidia/nemotron-3.5-super-vl-120b-a12b";
 const REQUEST_TIMEOUT_MS = 90_000;
-const AGENT_TIMEOUT_MS = 30_000;
+const AGENT_TIMEOUT_MS = 90_000;
 const MAX_QUESTION_CHARS = 4_000;
 const MAX_SYSTEM_CHARS = 2_000;
 
@@ -287,9 +287,11 @@ async function nimComplete(
   apiKey: string,
   baseUrl: string,
   model: string,
+  options: { maxTokens?: number; temperature?: number; timeoutMs?: number } = {},
 ): Promise<string> {
+  const timeoutMs = options.timeoutMs ?? AGENT_TIMEOUT_MS;
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AGENT_TIMEOUT_MS);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
@@ -305,9 +307,9 @@ async function nimComplete(
           { role: "system", content: systemPrompt },
           { role: "user", content: userPrompt },
         ],
-        temperature: 0.75,
+        temperature: options.temperature ?? 0.75,
         top_p: 0.95,
-        max_tokens: 120,
+        max_tokens: options.maxTokens ?? 120,
         chat_template_kwargs: { enable_thinking: false },
       }),
     });
@@ -336,7 +338,7 @@ async function nimComplete(
       .trim();
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
-      throw new Error("Agent turn timed out (30 s).");
+      throw new Error(`Agent turn timed out (${Math.round(timeoutMs / 1000)} s).`);
     }
     throw error;
   } finally {
@@ -702,6 +704,208 @@ export const agentChat = createServerFn({ method: "POST" })
       latencyMs,
       ...(degraded && notice ? { degraded, notice: notice.slice(0, 300) } : {}),
     };
+  });
+
+// ─── Supervisor incident report ──────────────────────────────────────────────
+// Once the 5 agents finish a cycle on a marked map event, the ORCHESTRATOR
+// (supervisor) reads their thread and issues one structured incident report for
+// the MONITOR AI panel. Any field the model omits — or the whole report, when
+// the API is offline — is compiled deterministically from the agent thread.
+
+export type SupervisorThreadLine = { from?: string; to?: string; text?: string };
+
+export type SupervisorReport = {
+  headline: string;
+  situation: string;
+  authorisedActions: string[];
+  unresolvedRisks: string[];
+  verdict: string;
+  t: string;
+  latencyMs: number;
+  /** Human-readable reason the local compile was used instead of the model. */
+  notice?: string;
+};
+
+type SupervisorReportPayload = {
+  headline?: unknown;
+  situation?: unknown;
+  authorisedActions?: unknown;
+  unresolvedRisks?: unknown;
+  verdict?: unknown;
+};
+
+const MAX_REPORT_LINES = 12;
+
+const SUPERVISOR_SYSTEM_PROMPT = [
+  "You are the ORCHESTRATOR (supervisor) of the NammaMayor OS crisis command centre for Bengaluru, India.",
+  "Five domain agents — PREDICTION, FORECAST, MOBILITY, SAFETY, COMMS — have just completed one response cycle on an incident marked on the live map.",
+  "Your job is to validate their consensus and issue a single incident report. You never generate domain messages yourself.",
+  "Rules:",
+  "1. Reply with a single JSON object only — no markdown fences, no commentary.",
+  "2. Use ONLY the incident details and the agent thread supplied by the operator; never invent sensors, units, roads or numbers that do not appear there.",
+  "3. headline: at most 90 characters, naming the incident, the location and the severity.",
+  "4. situation: one or two sentences confirming the scene as the agents established it.",
+  "5. authorisedActions: 2-5 imperative sentences taken from the MOBILITY, SAFETY and COMMS messages.",
+  "6. unresolvedRisks: 1-3 items the agents left open; use the FORECAST and PREDICTION projections as watch items.",
+  "7. verdict: one sentence (max 25 words) authorising or rejecting the agents' plan.",
+].join("\n");
+
+const SUPERVISOR_JSON_SCHEMA = `{
+  "headline": string,
+  "situation": string,
+  "authorisedActions": [string],
+  "unresolvedRisks": [string],
+  "verdict": string
+}`;
+
+// Last message in the thread authored by any of the given agents.
+function lastLineByAgent(lines: SupervisorThreadLine[], ...agents: string[]): string {
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i]!;
+    if (line.text && agents.includes(line.from ?? "")) return line.text;
+  }
+  return "";
+}
+
+// Deterministic compile used when NVIDIA NIM is offline, rate-limited, or
+// returns JSON missing a field. Actions come from the doing-agents, watch items
+// from the modelling agents.
+export function compileSupervisorReport(
+  ev: MarkedEventInput,
+  lines: SupervisorThreadLine[],
+): SupervisorReport {
+  const kind = ev.typeName || ev.type || "Incident";
+  const label = eventPlaybook(ev)?.label ?? kind.toLowerCase();
+  const sev = ev.severity || "CRITICAL";
+  const loc = ev.locationName || "the marked location";
+
+  const actions = ["MOBILITY", "SAFETY", "COMMS"]
+    .map((agent) => lastLineByAgent(lines, agent))
+    .filter(Boolean);
+  const watch = ["FORECAST", "prediction"]
+    .map((agent) => lastLineByAgent(lines, agent))
+    .filter(Boolean);
+
+  return {
+    headline: `${kind} at ${loc} · severity ${sev}`,
+    situation:
+      ev.description?.trim() ||
+      `Field report of a ${label} at ${loc}; the 5-agent cycle closed without a supervisor override.`,
+    authorisedActions: actions.length
+      ? actions
+      : [`Field units continue standard ${label} protocol at ${loc}.`],
+    unresolvedRisks: [
+      ...watch,
+      `${kind} at ${loc} stays open until on-site teams confirm clearance.`,
+    ].slice(0, 3),
+    verdict: `Cycle complete. Logged actions authorised; ${loc} remains under supervisor watch.`,
+    t: new Date().toLocaleTimeString("en-GB", { hour12: false }),
+    latencyMs: 0,
+  };
+}
+
+export const supervisorReport = createServerFn({ method: "POST" })
+  .validator(
+    (
+      input:
+        | {
+            markedEvent?: MarkedEventInput | null;
+            mode?: string;
+            messages?: SupervisorThreadLine[];
+          }
+        | undefined,
+    ) => {
+      const markedEvent = input?.markedEvent ?? null;
+      if (!markedEvent || !eventText(markedEvent.locationName, 120)) {
+        throw new Error("A marked incident with a location is required for a supervisor report.");
+      }
+      const messages = (Array.isArray(input?.messages) ? input.messages : [])
+        .map((line) => ({
+          from: eventText(line?.from, 24),
+          to: eventText(line?.to, 24),
+          text: eventText(line?.text, 300),
+        }))
+        .filter((line) => line.text)
+        .slice(-MAX_REPORT_LINES);
+
+      return {
+        markedEvent,
+        mode: typeof input?.mode === "string" ? input.mode : "idle",
+        messages,
+      };
+    },
+  )
+  .handler(async ({ data }): Promise<SupervisorReport> => {
+    const fallback = compileSupervisorReport(data.markedEvent, data.messages);
+    const apiKey = readEnv("NVIDIA_API_KEY");
+    if (!apiKey) {
+      return {
+        ...fallback,
+        notice:
+          "NVIDIA_API_KEY is not set — the supervisor report was compiled locally from the agent thread.",
+      };
+    }
+
+    const baseUrl = (readEnv("NVIDIA_BASE_URL") ?? DEFAULT_BASE_URL).replace(/\/+$/, "");
+    const model = readEnv("NVIDIA_MODEL") ?? readEnv("NVIDIA_VISION_MODEL") ?? DEFAULT_MODEL;
+    const ev = data.markedEvent;
+    const started = Date.now();
+    const modeContext = MODE_CONTEXT[data.mode] ?? MODE_CONTEXT["idle"]!;
+    const thread = data.messages.length
+      ? data.messages.map((line) => `${line.from || "AGENT"} → ${line.to || "?"}: ${line.text}`)
+      : ["(no agent messages recorded for this incident)"];
+
+    const userPrompt = [
+      `Incident: ${(ev.typeName || ev.type || "EMERGENCY").toUpperCase()} — ${
+        eventPlaybook(ev)?.label ?? "live incident"
+      }`,
+      `Location: ${ev.locationName} (${Number(ev.lat ?? 0).toFixed(4)}, ${Number(
+        ev.lng ?? 0,
+      ).toFixed(4)})`,
+      `Severity: ${ev.severity ?? "CRITICAL"}`,
+      ev.description ? `Operator description: ${ev.description}` : "",
+      `Mode context: ${modeContext}`,
+      "",
+      "Agent thread for this incident (oldest first):",
+      ...thread,
+      "",
+      "Return JSON with exactly this shape:",
+      SUPERVISOR_JSON_SCHEMA,
+    ]
+      .filter(Boolean)
+      .join("\n");
+
+    try {
+      const content = await nimComplete(
+        SUPERVISOR_SYSTEM_PROMPT,
+        userPrompt,
+        apiKey,
+        baseUrl,
+        model,
+        { maxTokens: 700, temperature: 0.35, timeoutMs: REQUEST_TIMEOUT_MS },
+      );
+      const root = asObject<SupervisorReportPayload>(extractJsonObject(content));
+
+      return {
+        headline: eventText(root.headline, 140) || fallback.headline,
+        situation: eventText(root.situation, 500) || fallback.situation,
+        authorisedActions: eventStringList(root.authorisedActions, fallback.authorisedActions, 5),
+        unresolvedRisks: eventStringList(root.unresolvedRisks, fallback.unresolvedRisks, 3),
+        verdict: eventText(root.verdict, 220) || fallback.verdict,
+        t: new Date().toLocaleTimeString("en-GB", { hour12: false }),
+        latencyMs: Date.now() - started,
+      };
+    } catch (error) {
+      const reason =
+        error instanceof Error && error.name === "AbortError"
+          ? "request timed out"
+          : errorMessage(error).slice(0, 200);
+      return {
+        ...fallback,
+        latencyMs: Date.now() - started,
+        notice: `Supervisor AI report unavailable (${reason}) — compiled locally from the agent thread.`,
+      };
+    }
   });
 
 // ─── Scheduled-event impact forecasting ──────────────────────────────────────

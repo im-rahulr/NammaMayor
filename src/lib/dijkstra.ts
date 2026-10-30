@@ -156,7 +156,10 @@ export function shortestPath(
 // Exhaustively enumerate every simple path between two junctions (graph is tiny).
 // Returns all candidate routes sorted by travel minutes — the first entry is the
 // shortest one. Coords are stitched from per-edge geometries.
-export type EnumeratedRoute = PathResult & { coords: [number, number][] };
+export type EnumeratedRoute = PathResult & {
+  nodeNames: string[];
+  coords: [number, number][];
+};
 
 export function enumerateAllRoutes(start: string, end: string, maxRoutes = 60): EnumeratedRoute[] {
   if (start === end) return [];

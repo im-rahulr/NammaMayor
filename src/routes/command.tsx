@@ -3,6 +3,17 @@ import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import type * as Leaflet from "leaflet";
 import "leaflet/dist/leaflet.css";
 import { CommandPanels } from "@/components/CommandPanels";
+import { EmergencyAlertPanel } from "@/components/EmergencyAlertPanel";
+import {
+  AI_BROADCAST_DELAY_MS,
+  DEFAULT_ALERT_CONTACTS,
+  loadAlertContacts,
+  saveAlertContacts,
+  schedulePublicAlert,
+  type AlertContact,
+  type AlertDispatch,
+  type IncidentAlertInput,
+} from "@/lib/emergency-alerts";
 import {
   computeImpact,
   computeDynamicRoadImpact,
@@ -369,6 +380,28 @@ function Command() {
   const markedEventRef = useRef(markedEvent);
   markedEventRef.current = markedEvent;
 
+  // WhatsApp public alert: numbers to warn, auto-fire toggle, last dispatch
+  const [alertContacts, setAlertContacts] = useState<AlertContact[]>(DEFAULT_ALERT_CONTACTS);
+  const [autoAlert, setAutoAlert] = useState(true);
+  const [activeAlert, setActiveAlert] = useState<{
+    incidentId: string;
+    incident: IncidentAlertInput;
+    dispatch: AlertDispatch;
+  } | null>(null);
+  const alertContactsRef = useRef(alertContacts);
+  alertContactsRef.current = alertContacts;
+  const autoAlertRef = useRef(autoAlert);
+  autoAlertRef.current = autoAlert;
+
+  useEffect(() => {
+    setAlertContacts(loadAlertContacts());
+  }, []);
+
+  const handleContactsChange = useCallback((next: AlertContact[]) => {
+    setAlertContacts(next);
+    saveAlertContacts(next);
+  }, []);
+
   // Free Location & Road Closure State
   const [origin, setOrigin] = useState<LocPoint>({
     id: "SILK",
@@ -427,8 +460,79 @@ function Command() {
     setFeed((f) => [{ t: now(), agent, msg, tone }, ...f].slice(0, 50));
   }, []);
 
+  // The COMMS agent's pending WhatsApp broadcast, cancellable while it counts down.
+  const cancelBroadcastRef = useRef<(() => void) | null>(null);
+  const alertAnnouncedRef = useRef<string | null>(null);
+
+  const firePublicAlert = useCallback(
+    (ev: MarkedEvent) => {
+      const incident: IncidentAlertInput = {
+        type: ev.type,
+        icon: ev.icon,
+        typeName: ev.typeName,
+        title: ev.title,
+        locationName: ev.locationName,
+        lat: ev.lat,
+        lng: ev.lng,
+        radiusM: ev.radiusM,
+        severity: ev.severity,
+        timestamp: ev.timestamp,
+        description: ev.description,
+      };
+      const people = alertContactsRef.current.length;
+      if (people === 0) {
+        push(
+          "COMMS",
+          "📱 No WhatsApp numbers on the alert list — add recipients to warn the public.",
+          "warn",
+        );
+        return;
+      }
+
+      cancelBroadcastRef.current?.();
+      cancelBroadcastRef.current = schedulePublicAlert(
+        incident,
+        alertContactsRef.current,
+        (dispatch) => {
+          setActiveAlert({ incidentId: ev.id, incident, dispatch });
+          // The countdown reports every second; each stage gets one feed line.
+          const announcedKey = `${ev.id}:${dispatch.stage}`;
+          const alreadyAnnounced = announcedKey === alertAnnouncedRef.current;
+          alertAnnouncedRef.current = announcedKey;
+          if (dispatch.stage === "preparing" && !alreadyAnnounced) {
+            push(
+              "COMMS",
+              `🤖 COMMS agent drafted the AVOID-TRAVELLING advisory for ${people} numbers — broadcasting on WhatsApp in ${AI_BROADCAST_DELAY_MS / 1000}s.`,
+              "agent",
+            );
+          } else if (dispatch.stage === "sent") {
+            push(
+              "COMMS",
+              dispatch.queued.length === 0
+                ? `🤖 WhatsApp advisory broadcast to all ${people} numbers.`
+                : `🤖 WhatsApp advisory sent to ${dispatch.opened?.name}; ${dispatch.queued.length} of ${people} numbers pending.`,
+              "ok",
+            );
+          } else if (dispatch.stage === "blocked" && !alreadyAnnounced) {
+            push(
+              "COMMS",
+              `📱 Browser blocked the WhatsApp window — tap SEND in the alert panel to warn ${people} numbers.`,
+              "warn",
+            );
+          }
+        },
+      );
+    },
+    [push],
+  );
+
   const handleMarkEvent = useCallback(
-    (lat: number, lng: number, evType: EventTypeItem = selectedEventTypeRef.current) => {
+    (
+      lat: number,
+      lng: number,
+      evType: EventTypeItem = selectedEventTypeRef.current,
+      opts?: { repositionOnly?: boolean },
+    ) => {
       const near = findNearestLocation(lat, lng);
       const distM = Math.round(Math.hypot(near.lat - lat, near.lng - lng) * 111000);
       const locName = distM < 400 ? near.name : `${near.name} Area (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
@@ -483,9 +587,14 @@ function Command() {
       push("SAFETY", workStatus.safety, "warn");
       push("COMMS", workStatus.comms, "ok");
 
+      // Re-dropping the pin on an existing incident must not re-message every number.
+      if (!opts?.repositionOnly && autoAlertRef.current) {
+        firePublicAlert(newEv);
+      }
+
       map.current?.flyTo([lat, lng], 15, { duration: 1.2 });
     },
-    [push],
+    [push, firePublicAlert],
   );
 
   const handleClearEvent = useCallback(() => {
@@ -493,8 +602,15 @@ function Command() {
     setEventMarkMode(false);
     eventLayer.current?.clearLayers();
     setDispatches([]);
+    if (activeAlert?.dispatch.stage === "preparing") {
+      cancelBroadcastRef.current?.();
+      push("COMMS", "🤖 COMMS agent aborted the WhatsApp broadcast — incident cleared.", "warn");
+    }
     push("SYS", "Map event cleared. 5 AI agents stand down and return to routine monitoring.", "ok");
-  }, [push]);
+  }, [push, activeAlert?.dispatch.stage]);
+
+  // Never leave a countdown running (or a broadcast window open) behind us.
+  useEffect(() => () => cancelBroadcastRef.current?.(), []);
 
   // clock + boot
   useEffect(() => {
@@ -1182,7 +1298,7 @@ function Command() {
     marker.on("dragend", (e: Leaflet.LeafletEvent) => {
       const tgt = e.target as Leaflet.Marker;
       const pos = tgt.getLatLng();
-      handleMarkEvent(pos.lat, pos.lng, selectedEventTypeRef.current);
+      handleMarkEvent(pos.lat, pos.lng, selectedEventTypeRef.current, { repositionOnly: true });
     });
 
     // 2. Hazard Perimeter Circle (Prediction / Forecast AI)
@@ -1836,6 +1952,14 @@ function Command() {
                 </div>
               </div>
             </div>
+
+            <EmergencyAlertPanel
+              active={activeAlert}
+              contacts={alertContacts}
+              onContactsChange={handleContactsChange}
+              autoAlert={autoAlert}
+              onAutoAlertChange={setAutoAlert}
+            />
 
             <button
               onClick={() => run("gas")}

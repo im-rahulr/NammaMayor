@@ -124,6 +124,7 @@ function RouteEngine() {
 
     g.clearLayers();
     const timers: ReturnType<typeof setTimeout>[] = [];
+    let timer: ReturnType<typeof setTimeout> | null = null;
 
     // 1. all other candidate corridors — blue, staggered fade-in
     routes
@@ -215,7 +216,6 @@ function RouteEngine() {
       const drawMs = Math.min(2800, 1000 + total * 110);
       const t0 = Date.now();
       let partial: Leaflet.Polyline | null = null;
-      let timer: ReturnType<typeof setTimeout> | null = null;
       const easedAt = (p: number) => 1 - Math.pow(1 - p, 2.4);
       const tick = () => {
         const p = Math.min(1, (Date.now() - t0) / drawMs);
