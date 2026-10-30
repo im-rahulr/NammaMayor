@@ -41,6 +41,10 @@ export type AgentMessage = {
 export type AgentTurnResult = {
   messages: AgentMessage[];
   latencyMs: number;
+  /** True when the live model call failed and a local fallback was used. */
+  degraded?: boolean;
+  /** Human-readable reason for the fallback, surfaced as a UI popup. */
+  notice?: string;
 };
 
 // Ordered list of (from, to) pairs that define one conversation cycle.
@@ -149,6 +153,20 @@ function clampTokens(value: unknown): number {
   return Math.min(16_384, Math.max(256, Math.round(n)));
 }
 
+function errorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) return error.message;
+  if (typeof error === "string" && error.trim()) return error.trim();
+  return "unknown error";
+}
+
+// Builds an Error whose message keeps the HTTP status (and Retry-After when the
+// provider sends one) so the client can classify it and pop the right notice.
+function httpError(status: number, body: string, retryAfter: string | null): Error {
+  const seconds = retryAfter && /^\d+$/.test(retryAfter.trim()) ? retryAfter.trim() : null;
+  const retry = seconds ? ` (retry after ${seconds}s)` : "";
+  return new Error(`NVIDIA API ${status}${retry}: ${body.slice(0, 400) || "no response body"}`);
+}
+
 export const askQuestion = createServerFn({ method: "POST" })
   .validator(
     (
@@ -214,9 +232,7 @@ export const askQuestion = createServerFn({ method: "POST" })
 
       const body = await response.text();
       if (!response.ok) {
-        throw new Error(
-          `NVIDIA API ${response.status}: ${body.slice(0, 400) || "no response body"}`,
-        );
+        throw httpError(response.status, body, response.headers.get("retry-after"));
       }
 
       let payload: NimPayload;
@@ -298,7 +314,7 @@ async function nimComplete(
 
     const body = await response.text();
     if (!response.ok) {
-      throw new Error(`NVIDIA API ${response.status}: ${body.slice(0, 200) || "no body"}`);
+      throw httpError(response.status, body, response.headers.get("retry-after"));
     }
 
     let payload: NimPayload;
@@ -312,10 +328,11 @@ async function nimComplete(
     if (typeof content !== "string" || !content.trim()) {
       throw new Error("NVIDIA API returned an empty agent message.");
     }
-    // Strip any self-referencing prefix like "prediction: " the model may add
+    // Strip any self-referencing prefix like "prediction: " or
+    // "FORECAST to MOBILITY:" the model may add.
     return content
       .trim()
-      .replace(/^[A-Za-z]+:\s*/, "")
+      .replace(/^[A-Za-z]+(?:\s*(?:→|->|to)\s*[A-Za-z]+)?:\s*/, "")
       .trim();
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
@@ -346,6 +363,191 @@ export type MarkedEventInput = {
   description?: string;
 };
 
+// ─── Event-type playbooks ─────────────────────────────────────────────────────
+// Each marked map event re-frames the agents' domains. Without this a collision
+// thread inherits the flood-centric defaults and the agents end up discussing
+// rainfall gauges instead of the crash. `focus` steers the live model prompt and
+// `fallback` is used verbatim when the NVIDIA API is offline or rate-limited.
+
+type EventPlaybook = {
+  label: string;
+  focus: Record<AgentId, string>;
+  fallback: Record<AgentId, string>;
+};
+
+const EVENT_PLAYBOOKS: Record<string, EventPlaybook> = {
+  accident: {
+    label: "major road collision",
+    focus: {
+      prediction:
+        "CCTV and vehicle-occupancy evidence of the collision — vehicles involved, lanes blocked, debris field and secondary-collision risk",
+      FORECAST:
+        "queue growth, congestion spillback minutes and secondary-crash probability — never rainfall or hydrology",
+      MOBILITY: "lane closures, contraflow and BMTC diversions around the collision site",
+      SAFETY: "ambulance, trauma-care, extrication and police units for casualties",
+      COMMS: "a public collision advisory naming the junction and alternate routes",
+    },
+    fallback: {
+      prediction:
+        "CCTV node #BLR-{node} confirms a {sev} multi-vehicle collision at {loc}; 2 of 3 lanes blocked with debris across the carriageway.",
+      FORECAST:
+        "Queue spillback from {loc} reaches 1.4 km in 18 minutes; secondary-collision risk HIGH on the approach.",
+      MOBILITY:
+        "Closing the two blocked lanes at {loc}; diverting BMTC Route 335 via Residency Road and MG Road (+8 min).",
+      SAFETY:
+        "Dispatched 2 EMS ambulances, 1 rescue tender and 2 police units to {loc}; extrication team ETA 4 minutes.",
+      COMMS:
+        "Issued collision advisory in Kannada and English to 12,400 commuters via cell broadcast and VMS boards around {loc}.",
+    },
+  },
+  flood: {
+    label: "flood / inundation",
+    focus: {
+      prediction:
+        "rainfall gauge readings, stormwater drain capacity, standing-water depth and CCTV evidence of inundation",
+      FORECAST: "flood-depth projections, drain overflow timing and minutes until peak inundation",
+      MOBILITY:
+        "underpass closures, waterlogging diversions and BMTC rerouting around the flooded stretch",
+      SAFETY: "dewatering pumps, rescue boats and evacuation of stranded vehicles",
+      COMMS: "a public flood advisory naming the junction and alternate routes",
+    },
+    fallback: {
+      prediction:
+        "Gauge #{node} at {loc} reads 52 mm/hr; stormwater drain DRN-042 is at 97% capacity with 0.4 m standing water.",
+      FORECAST:
+        "Waterlogging at {loc} reaches 0.65 m in 20 minutes; flood risk {sev} across the catchment.",
+      MOBILITY:
+        "Closing the {loc} underpass; diverting BMTC Route 335 via 100ft Inner Ring Road (+11 min).",
+      SAFETY: "Deploying 3 dewatering pumps and 2 rescue boats to {loc}; staging ETA 4 minutes.",
+      COMMS:
+        "Issued flash-flood evacuation advisory in Kannada and English to 28,000 residents around {loc}.",
+    },
+  },
+  gas: {
+    label: "gas leak / hazmat",
+    focus: {
+      prediction:
+        "methane/LEL sensor readings, wind vector and CCTV confirmation of the leak source",
+      FORECAST:
+        "plume dispersion direction, downwind exposure radius and minutes to the nearest cluster",
+      MOBILITY: "road barricades and BMTC diversions around the exclusion zone",
+      SAFETY: "fire tenders, hazmat suppression and shelter-in-place enforcement",
+      COMMS: "a shelter-in-place broadcast in EN/KN/HI to residents downwind",
+    },
+    fallback: {
+      prediction:
+        "Methane array at {loc} confirms 4.3% LEL; wind vector NE at 3 m/s from the breach.",
+      FORECAST:
+        "Vapour plume from {loc} expands 600 m northeast toward the nearest residential cluster in 22 minutes.",
+      MOBILITY:
+        "Barricading all approaches to {loc}; rerouting BMTC Route 343 via 27th Main (+6 min).",
+      SAFETY:
+        "Dispatched 2 fire tenders and a hazmat unit to {loc}; exclusion cordon ETA 3 minutes.",
+      COMMS: "Shelter-in-place order issued in EN/KN/HI to 9,600 residents downwind of {loc}.",
+    },
+  },
+  roadblock: {
+    label: "road cave-in / block",
+    focus: {
+      prediction:
+        "pavement-subsidence sensor readings, CCTV of the cave-in and the exact closed carriageway",
+      FORECAST: "queue growth and minutes until congestion spills onto parallel arterials",
+      MOBILITY: "contraflow and BMTC rerouting around the closed thoroughfare",
+      SAFETY: "barricades, police cordon and NDRF/crane support at the sinkhole",
+      COMMS: "a road-closure advisory with alternate routes",
+    },
+    fallback: {
+      prediction:
+        "Pavement sensor #{node} at {loc} shows 38 mm subsidence; CCTV confirms a 6 m sinkhole across the northbound lanes.",
+      FORECAST:
+        "Queue spillback from {loc} reaches 2.1 km in 25 minutes; adjacent arterials saturate within 40 minutes.",
+      MOBILITY:
+        "Closing {loc} to all traffic; contraflow on the service road and BMTC Route 500 diverted (+14 min).",
+      SAFETY: "Cordoned {loc} with 2 police units and an NDRF assessment team; ETA 6 minutes.",
+      COMMS: "Road-closure advisory issued to 18,300 commuters with alternate routes around {loc}.",
+    },
+  },
+  fire: {
+    label: "fire / industrial hazard",
+    focus: {
+      prediction:
+        "thermal sensor and CCTV confirmation of the fire front, wind speed and structure involvement",
+      FORECAST: "flame spread direction, particulate plume radius and downwind exposure in minutes",
+      MOBILITY: "road closures and BMTC diversions around the fire perimeter",
+      SAFETY: "fire tenders, water tankers and evacuation of adjacent buildings",
+      COMMS: "a smoke-hazard advisory and evacuation broadcast",
+    },
+    fallback: {
+      prediction:
+        "Thermal sensor #{node} at {loc} reads 640°C; CCTV confirms fire across two structures with wind at 4 m/s.",
+      FORECAST:
+        "Flame front at {loc} spreads 300 m downwind in 15 minutes; smoke plume risk {sev}.",
+      MOBILITY:
+        "Closing all roads within 500 m of {loc}; BMTC Route 356 diverted via Old Madras Road (+9 min).",
+      SAFETY:
+        "Dispatched 4 fire tenders and 2 water tankers to {loc}; evacuation of adjacent blocks ETA 5 minutes.",
+      COMMS:
+        "Smoke-hazard and evacuation broadcast issued in EN/KN/HI to 14,700 residents near {loc}.",
+    },
+  },
+  medical: {
+    label: "mass casualty / medical surge",
+    focus: {
+      prediction:
+        "casualty-count telemetry, hospital intake and CCTV confirmation of the mass-casualty scene",
+      FORECAST:
+        "casualty surge projection, triage load and minutes until hospital capacity pressure",
+      MOBILITY: "ambulance corridor clearance and BMTC diversions around the casualty scene",
+      SAFETY: "triage teams, ambulance convoys and hospital bed allocation",
+      COMMS: "a public advisory for blood donation and hospital diversion",
+    },
+    fallback: {
+      prediction:
+        "Casualty telemetry at {loc} reports 14 injured; CCTV confirms a mass-gathering surge at the scene.",
+      FORECAST:
+        "Casualty surge from {loc} reaches 26 patients within 30 minutes; nearest trauma centre at 88% capacity.",
+      MOBILITY:
+        "Clearing an ambulance corridor on the {loc} approach; BMTC Route 342 diverted (+5 min).",
+      SAFETY:
+        "Dispatched 6 ambulances and 2 triage teams to {loc}; hospital bed allocation confirmed, ETA 4 minutes.",
+      COMMS:
+        "Public advisory issued in Kannada and English directing donors to Victoria Hospital; 21,000 reached.",
+    },
+  },
+};
+
+function eventPlaybook(ev: MarkedEventInput | null): EventPlaybook | null {
+  if (!ev) return null;
+  return EVENT_PLAYBOOKS[(ev.type ?? "").toLowerCase()] ?? null;
+}
+
+function eventNodeId(ev: MarkedEventInput): number {
+  const lat = typeof ev.lat === "number" ? ev.lat : 0;
+  return (Math.abs(Math.round(lat * 1000)) % 900) + 100;
+}
+
+// Appends a high-priority incident override to the agent's base role so a
+// collision, fire or gas event never inherits the flood-only vocabulary.
+function buildAgentSystemPrompt(from: AgentId, ev: MarkedEventInput | null): string {
+  const base = AGENT_SYSTEM_PROMPTS[from];
+  if (!ev || !ev.locationName) return base;
+
+  const playbook = eventPlaybook(ev);
+  const label = playbook?.label ?? (ev.typeName || ev.type || "live incident").toLowerCase();
+  const severity = ev.severity || "CRITICAL";
+  const focus = playbook?.focus[from] ?? `the ${label} at ${ev.locationName}`;
+
+  return [
+    base,
+    "",
+    "── LIVE INCIDENT OVERRIDE (highest priority) ──",
+    `Active incident: ${label.toUpperCase()} at ${ev.locationName}. Severity: ${severity}.`,
+    `Your focus for this incident: ${focus}.`,
+    "Rainfall, drainage and hydrology are IRRELEVANT unless the incident itself is a flood — never mention them.",
+    `Every message must name the ${label} and ${ev.locationName}.`,
+  ].join("\n");
+}
+
 // Domain-aware fallback responses when API is slow, offline, or rate-limited
 function generateDomainFallback(
   from: AgentId,
@@ -357,12 +559,21 @@ function generateDomainFallback(
     const loc = ev.locationName;
     const kind = ev.typeName || ev.type || "incident";
     const sev = ev.severity || "CRITICAL";
+    const playbook = eventPlaybook(ev);
+
+    if (playbook) {
+      return playbook.fallback[from]
+        .replace(/\{loc\}/g, loc)
+        .replace(/\{sev\}/g, sev)
+        .replace(/\{kind\}/g, kind)
+        .replace(/\{node\}/g, String(eventNodeId(ev)));
+    }
 
     switch (from) {
       case "prediction":
-        return `Sensor Node #BLR-402 at ${loc} confirms ${kind} spike; CCTV telemetry shows active threat level ${sev}.`;
+        return `Sensor Node #BLR-${eventNodeId(ev)} at ${loc} confirms ${kind} anomaly; CCTV telemetry shows threat level ${sev}.`;
       case "FORECAST":
-        return `Hydrological & hazard dispersion model predicts 450m impact perimeter around ${loc} for next 40 minutes.`;
+        return `Impact model projects a 450 m escalation perimeter around ${loc} over the next 40 minutes; risk ${sev}.`;
       case "MOBILITY":
         return `Activated detour cordon around ${loc}; diverting arterial traffic and BMTC fleet via parallel corridor (+7 min delta).`;
       case "SAFETY":
@@ -443,30 +654,43 @@ export const agentChat = createServerFn({ method: "POST" })
     const model = readEnv("NVIDIA_MODEL") ?? readEnv("NVIDIA_VISION_MODEL") ?? DEFAULT_MODEL;
 
     const [from, to] = AGENT_TURN_ORDER[data.turnIndex]!;
-    const systemPrompt = AGENT_SYSTEM_PROMPTS[from];
+    const systemPrompt = buildAgentSystemPrompt(from, data.markedEvent);
 
     let incidentCtx = MODE_CONTEXT[data.mode] ?? MODE_CONTEXT["idle"]!;
     if (data.markedEvent && data.markedEvent.locationName) {
       const ev = data.markedEvent;
-      incidentCtx = `ACTIVE MARKED MAP EVENT: [${(ev.typeName || ev.type || "EMERGENCY").toUpperCase()}] at ${ev.locationName} (Coords: ${ev.lat?.toFixed(4)}, ${ev.lng?.toFixed(4)}). Severity: ${ev.severity ?? "CRITICAL"}. Description: ${ev.description || "Active field incident marked on Bengaluru live crisis map"}. Respond directly with operational action for this specific event and location.`;
+      const label = eventPlaybook(ev)?.label ?? ev.typeName ?? ev.type ?? "emergency";
+      incidentCtx = `ACTIVE MARKED MAP EVENT: [${(ev.typeName || ev.type || "EMERGENCY").toUpperCase()} — ${label.toUpperCase()}] at ${ev.locationName} (Coords: ${ev.lat?.toFixed(4)}, ${ev.lng?.toFixed(4)}). Severity: ${ev.severity ?? "CRITICAL"}. Description: ${ev.description || "Active field incident marked on Bengaluru live crisis map"}. Stay on this event only — do not drift to unrelated hazards.`;
     }
 
     // Build the user prompt seen by the FROM agent
+    const openingLine =
+      data.markedEvent?.locationName && (data.markedEvent.typeName || data.markedEvent.type)
+        ? `Open the incident thread by confirming the ${data.markedEvent.typeName || data.markedEvent.type} at ${data.markedEvent.locationName}, then state your first concrete finding or action.`
+        : "State your first operational finding or action for this incident.";
+
     const userPrompt = data.lastMessage
-      ? `[${incidentCtx}]\n\n${to} is waiting for your update. The last message in the channel was: "${data.lastMessage}"\n\nRespond as ${from}, addressing ${to} with a single operational sentence.`
-      : `[${incidentCtx}]\n\nAddress ${to} with your first operational update regarding this incident. One sentence only.`;
+      ? `[${incidentCtx}]\n\n${to} is waiting for your update. The last message in the channel was: "${data.lastMessage}"\n\nRespond as ${from}, addressing ${to} with a single operational sentence about this incident.`
+      : `[${incidentCtx}]\n\n${openingLine} Address ${to}. One sentence only.`;
 
     const started = Date.now();
     let text = "";
+    let degraded = false;
+    let notice: string | undefined;
 
     if (apiKey) {
       try {
         text = await nimComplete(systemPrompt, userPrompt, apiKey, baseUrl, model);
-      } catch {
-        // Fallback gracefully to domain generation if NVIDIA API encounters an issue
+      } catch (error) {
+        // Fall back gracefully, but tell the client so it can show a popup.
+        degraded = true;
+        notice = `NVIDIA NIM agent call failed (${errorMessage(error)}) — showing a local fallback response.`;
         text = generateDomainFallback(from, to, data.markedEvent, data.mode);
       }
     } else {
+      degraded = true;
+      notice =
+        "NVIDIA_API_KEY is not set — showing local fallback responses instead of live AI agents.";
       text = generateDomainFallback(from, to, data.markedEvent, data.mode);
     }
 
@@ -476,6 +700,7 @@ export const agentChat = createServerFn({ method: "POST" })
     return {
       messages: [{ from, to, text, t }],
       latencyMs,
+      ...(degraded && notice ? { degraded, notice: notice.slice(0, 300) } : {}),
     };
   });
 
@@ -758,7 +983,7 @@ export const predictEventImpact = createServerFn({ method: "POST" })
 
       const body = await response.text();
       if (!response.ok) {
-        throw new Error(`NVIDIA API ${response.status}: ${body.slice(0, 200) || "no body"}`);
+        throw httpError(response.status, body, response.headers.get("retry-after"));
       }
 
       let payload: NimPayload;
@@ -782,14 +1007,12 @@ export const predictEventImpact = createServerFn({ method: "POST" })
       const reason =
         error instanceof Error && error.name === "AbortError"
           ? "request timed out"
-          : error instanceof Error
-            ? error.message
-            : "request failed";
+          : errorMessage(error);
       return {
         ...fallback,
         model: "deterministic-model",
         latencyMs: Date.now() - started,
-        notice: `AI report unavailable (${reason.slice(0, 160)}) — showing the deterministic model estimate.`,
+        notice: `AI report unavailable (${reason.slice(0, 200)}) — showing the deterministic model estimate.`,
       };
     } finally {
       clearTimeout(timer);

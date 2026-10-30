@@ -23,6 +23,7 @@ import {
   type RiskLevel,
 } from "@/lib/city-events";
 import { askQuestion, predictEventImpact, type EventImpactResult } from "@/lib/nvidia";
+import { notifyAiIssue } from "@/lib/ai-toast";
 
 export const Route = createFileRoute("/events")({
   head: () => ({
@@ -321,10 +322,23 @@ function EventsPage() {
     inFlight.current.add(event.id);
     setLoadingId(event.id);
 
+    const retryReport = () =>
+      setReports((prev) => {
+        const next = { ...prev };
+        delete next[event.id];
+        return next;
+      });
+
     predictEventImpact({ data: event })
-      .then((result) => setReports((prev) => ({ ...prev, [event.id]: result })))
-      .catch(() => {
-        // Deterministic fallback is already on screen — nothing else to do.
+      .then((result) => {
+        setReports((prev) => ({ ...prev, [event.id]: result }));
+        // The server falls back to the deterministic model on AI failure; pop
+        // the reason (rate limit, quota, timeout…) instead of hiding it.
+        if (result.notice) notifyAiIssue(result.notice, { retry: retryReport });
+      })
+      .catch((error: unknown) => {
+        // Deterministic fallback is already on screen, but surface why AI failed.
+        notifyAiIssue(error, { retry: retryReport });
       })
       .finally(() => {
         inFlight.current.delete(event.id);
@@ -373,6 +387,7 @@ function EventsPage() {
           error: error instanceof Error ? error.message : "Briefing request failed.",
         },
       }));
+      notifyAiIssue(error, { retry: () => void runBriefing() });
     }
   };
 

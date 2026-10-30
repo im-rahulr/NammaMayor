@@ -11,6 +11,7 @@ import {
 } from "@/lib/nvidia";
 import { Dialog, DialogContent } from "@/components/ui/dialog";
 import type { NewsItem } from "@/lib/news-rss";
+import { notifyAiIssue } from "@/lib/ai-toast";
 
 type Feed = { t: string; agent: string; msg: string; tone: "sys" | "agent" | "warn" | "ok" };
 
@@ -139,6 +140,7 @@ function QuestionPanel() {
       setResult(await askQuestion({ data: { question: q } }));
     } catch (err) {
       setError(err instanceof Error ? err.message : "Question request failed.");
+      notifyAiIssue(err, { retry: () => void handleAsk(q) });
     } finally {
       setBusy(false);
     }
@@ -319,8 +321,6 @@ export function CommandPanels({
   const turnIndexRef = useRef(0);
   // Track last message text for the next agent's context
   const lastMsgRef = useRef("");
-  // Whether an API call is in-flight (prevent overlapping calls)
-  const busyRef = useRef(false);
   const chatEnd = useRef<HTMLDivElement>(null);
   const [cctvOpen, setCctvOpen] = useState(false);
   const [agentError, setAgentError] = useState<string | null>(null);
@@ -374,91 +374,165 @@ export function CommandPanels({
   }, []);
 
   // ── Real API agent loop ────────────────────────────────────────────────────
-  // Each tick fires one agentChat call. We use a ref-based flag so no
-  // concurrent calls fire even if the effect re-runs.
-  const fireTurn = useCallback(async () => {
-    if (busyRef.current || pausedRef.current) return;
-    busyRef.current = true;
-    setAgentError(null);
-    try {
-      const result = await agentChat({
-        data: {
-          turnIndex: turnIndexRef.current,
-          lastMessage: lastMsgRef.current,
-          mode: modeRef.current,
-          markedEvent: markedEventRef.current
-            ? {
-                type: markedEventRef.current.type,
-                typeName: markedEventRef.current.typeName,
-                locationName: markedEventRef.current.locationName,
-                lat: markedEventRef.current.lat,
-                lng: markedEventRef.current.lng,
-                severity: markedEventRef.current.severity,
-                description: markedEventRef.current.description,
-              }
-            : null,
-        },
-      });
-      const [msg] = result.messages;
-      if (msg) {
-        setMsgs((m) => [...m, msg].slice(-60));
-        lastMsgRef.current = msg.text;
+  // Every turn is serialized through a promise chain, so an incident burst and
+  // the background cadence never overlap or drop each other's messages.
+  const turnChainRef = useRef<Promise<void>>(Promise.resolve());
+  const queuedRef = useRef(false);
+  const burstRef = useRef(0);
+  const activeEventIdRef = useRef<string | null>(null);
 
-        // Build a supervisor log entry
-        const ts = msg.t;
-        const lat = result.latencyMs;
-        const logEntry: Log =
-          lat > 20_000
-            ? {
-                t: ts,
-                level: "WARN",
-                text: `${msg.from} → ${msg.to}: response slow (${lat} ms), monitoring.`,
-              }
-            : turnIndexRef.current % 5 === 4
+  const runTurn = useCallback(() => {
+    const execute = async () => {
+      if (pausedRef.current) return;
+      // Capture the incident this turn belongs to. If a new event is marked
+      // while the call is in flight, the stale reply is discarded so the chat
+      // never shows the previous scenario after the incident banner updates.
+      const eventIdAtStart = activeEventIdRef.current;
+      const ev = markedEventRef.current;
+      setAgentError(null);
+      try {
+        const result = await agentChat({
+          data: {
+            turnIndex: turnIndexRef.current,
+            lastMessage: lastMsgRef.current,
+            mode: modeRef.current,
+            markedEvent: ev
+              ? {
+                  type: ev.type,
+                  typeName: ev.typeName,
+                  locationName: ev.locationName,
+                  lat: ev.lat,
+                  lng: ev.lng,
+                  severity: ev.severity,
+                  description: ev.description,
+                }
+              : null,
+          },
+        });
+        if (eventIdAtStart !== activeEventIdRef.current) return;
+        if (result.notice) {
+          // Live model failed and a fallback answered — pop the reason, but at
+          // most once a minute so the 5-agent loop cannot flood the screen.
+          notifyAiIssue(result.notice, { cooldownMs: 60_000 });
+        }
+        const [msg] = result.messages;
+        if (msg) {
+          setMsgs((m) => [...m, msg].slice(-60));
+          lastMsgRef.current = msg.text;
+
+          // Build a supervisor log entry
+          const ts = msg.t;
+          const lat = result.latencyMs;
+          const logEntry: Log =
+            lat > 20_000
               ? {
                   t: ts,
-                  level: "OK",
-                  text: `Cycle complete. All 5 agents synchronized for active operations.`,
+                  level: "WARN",
+                  text: `${msg.from} → ${msg.to}: response slow (${lat} ms), monitoring.`,
                 }
-              : {
-                  t: ts,
-                  level: "INFO",
-                  text: `${msg.from} → ${msg.to} · ${lat} ms · operational directive OK`,
-                };
-        setLogs((l) => [logEntry, ...l].slice(0, 80));
+              : turnIndexRef.current % 5 === 4
+                ? {
+                    t: ts,
+                    level: "OK",
+                    text: `Cycle complete. All 5 agents synchronized for active operations.`,
+                  }
+                : {
+                    t: ts,
+                    level: "INFO",
+                    text: `${msg.from} → ${msg.to} · ${lat} ms · operational directive OK`,
+                  };
+          setLogs((l) => [logEntry, ...l].slice(0, 80));
+        }
+        turnIndexRef.current = (turnIndexRef.current + 1) % AGENT_TURN_ORDER.length;
+      } catch (err) {
+        if (eventIdAtStart !== activeEventIdRef.current) return;
+        const msg = err instanceof Error ? err.message : "Agent API error";
+        setAgentError(msg);
+        notifyAiIssue(err, { cooldownMs: 60_000 });
+        setLogs((l) =>
+          [
+            { t: now(), level: "WARN" as const, text: `Agent API note: ${msg.slice(0, 80)}` },
+            ...l,
+          ].slice(0, 80),
+        );
       }
-      turnIndexRef.current = (turnIndexRef.current + 1) % AGENT_TURN_ORDER.length;
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : "Agent API error";
-      setAgentError(msg);
-      setLogs((l) =>
-        [
-          { t: now(), level: "WARN" as const, text: `Agent API note: ${msg.slice(0, 80)}` },
-          ...l,
-        ].slice(0, 80),
-      );
-    } finally {
-      busyRef.current = false;
-    }
+    };
+
+    const next = turnChainRef.current.then(execute, execute);
+    turnChainRef.current = next.catch(() => {});
+    return next;
   }, []);
 
-  // When markedEvent updates, reset chat turn cycle to 0 and trigger immediate response!
-  useEffect(() => {
-    if (markedEvent) {
-      setPaused(false);
-      turnIndexRef.current = 0;
-      lastMsgRef.current = "";
-      setLogs((l) => {
-        const entry: Log = {
-          t: now(),
-          level: "WARN",
-          text: `🚨 INCIDENT REPORTED ON MAP: ${markedEvent.icon} ${markedEvent.typeName} at ${markedEvent.locationName}. 5 AI response team engaged!`,
-        };
-        return [entry, ...l].slice(0, 80);
-      });
-      void fireTurn();
+  // Background cadence: one turn per tick, skipped while an incident burst runs.
+  const fireTurn = useCallback(async () => {
+    if (pausedRef.current || burstRef.current || queuedRef.current) return;
+    queuedRef.current = true;
+    try {
+      await runTurn();
+    } finally {
+      queuedRef.current = false;
     }
-  }, [markedEvent, fireTurn]);
+  }, [runTurn]);
+
+  // A marked event opens a fresh thread and runs one full 5-agent cycle
+  // immediately, so the collision is on screen the moment it is reported.
+  const runIncidentBurst = useCallback(
+    async (eventId: string) => {
+      // Token instead of a boolean: if a second event is marked mid-burst, the
+      // old burst cannot clear the new burst's flag when it unwinds.
+      const token = burstRef.current + 1;
+      burstRef.current = token;
+      try {
+        for (let turn = 0; turn < AGENT_TURN_ORDER.length; turn += 1) {
+          if (activeEventIdRef.current !== eventId) break;
+          await runTurn();
+          if (activeEventIdRef.current !== eventId) break;
+          await new Promise((resolve) => setTimeout(resolve, 500));
+        }
+      } finally {
+        if (burstRef.current === token) burstRef.current = 0;
+      }
+    },
+    [runTurn],
+  );
+
+  // When markedEvent updates, reset the thread and respond to it immediately.
+  useEffect(() => {
+    if (!markedEvent) {
+      activeEventIdRef.current = null;
+      return;
+    }
+    if (activeEventIdRef.current === markedEvent.id) return;
+
+    activeEventIdRef.current = markedEvent.id;
+    setPaused(false);
+    pausedRef.current = false;
+
+    // Seed the thread instantly with the incident's opening line so the very
+    // first chat bubble already describes the collision (shown in red), then
+    // let the live agents continue the conversation from there.
+    const seedText = markedEvent.workStatus?.prediction?.trim();
+    if (seedText) {
+      setMsgs([{ from: "prediction", to: "FORECAST", text: seedText, t: now() }]);
+      lastMsgRef.current = seedText;
+      turnIndexRef.current = 1;
+    } else {
+      setMsgs([]);
+      lastMsgRef.current = "";
+      turnIndexRef.current = 0;
+    }
+    setLogs((l) =>
+      [
+        {
+          t: now(),
+          level: "WARN" as const,
+          text: `🚨 INCIDENT REPORTED ON MAP: ${markedEvent.icon} ${markedEvent.typeName} at ${markedEvent.locationName}. 5 AI response team engaged!`,
+        },
+        ...l,
+      ].slice(0, 80),
+    );
+    void runIncidentBurst(markedEvent.id);
+  }, [markedEvent, runIncidentBurst]);
 
   useEffect(() => {
     const delay = live ? LIVE_INTERVAL_MS : PAUSED_CHECK_MS;
@@ -468,18 +542,6 @@ export function CommandPanels({
     // Fire immediately on mount / mode change
     void fireTurn();
     return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [live, fireTurn]);
-
-  useEffect(() => {
-    const delay = live ? LIVE_INTERVAL_MS : PAUSED_CHECK_MS;
-    const id = setInterval(() => {
-      void fireTurn();
-    }, delay);
-    // Fire immediately on mount / mode change
-    void fireTurn();
-    return () => clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [live, fireTurn]);
 
   useEffect(() => {
@@ -692,7 +754,9 @@ export function CommandPanels({
                       </span>
                     </div>
                     <div className="text-[10px] text-muted-foreground">
-                      Location: <b className="text-foreground">{markedEvent.locationName}</b> ({markedEvent.lat.toFixed(4)}, {markedEvent.lng.toFixed(4)}) · Radius: {markedEvent.radiusM}m
+                      Location: <b className="text-foreground">{markedEvent.locationName}</b> (
+                      {markedEvent.lat.toFixed(4)}, {markedEvent.lng.toFixed(4)}) · Radius:{" "}
+                      {markedEvent.radiusM}m
                     </div>
                   </div>
                 </div>
@@ -720,7 +784,8 @@ export function CommandPanels({
                       PREDICTION
                     </div>
                     <div className="mt-1 text-muted-foreground text-[10px] leading-tight">
-                      {markedEvent.workStatus?.prediction || "Sensor analytics & CCTV stream verified"}
+                      {markedEvent.workStatus?.prediction ||
+                        "Sensor analytics & CCTV stream verified"}
                     </div>
                   </div>
                   <div className="rounded-sm border border-primary/40 bg-background/70 p-2">
@@ -764,8 +829,13 @@ export function CommandPanels({
             </div>
           ) : (
             <div className="border-b bg-card/40 px-4 py-2 text-[11px] font-mono text-muted-foreground flex items-center justify-between">
-              <span>STATUS: Routine urban monitoring. Click <b>"MARK EVENT"</b> on the map above to deploy all 5 AI agents to any Bangalore location.</span>
-              <span className="rounded bg-success/20 text-success text-[10px] px-1.5 py-0.5 font-bold">ALL-CLEAR</span>
+              <span>
+                STATUS: Routine urban monitoring. Click <b>"MARK EVENT"</b> on the map above to
+                deploy all 5 AI agents to any Bangalore location.
+              </span>
+              <span className="rounded bg-success/20 text-success text-[10px] px-1.5 py-0.5 font-bold">
+                ALL-CLEAR
+              </span>
             </div>
           )}
           <div className="flex-1 space-y-3 overflow-y-auto p-4 font-mono text-xs">
@@ -776,13 +846,35 @@ export function CommandPanels({
             )}
             {msgs.map((m, k) => {
               const right = AGENT_LIST.indexOf(m.from) % 2 === 1;
+              // The first bubble after an incident is marked is the opening
+              // report — highlight it red so the collision is unmissable.
+              const isIncidentOpening = !!markedEvent && k === 0;
               return (
                 <div key={k} className={`flex ${right ? "justify-end" : ""}`}>
-                  <div className="max-w-[75%] rounded-sm border bg-background/70 p-3">
+                  <div
+                    className={`max-w-[75%] rounded-sm border p-3 ${
+                      isIncidentOpening
+                        ? "border-destructive bg-destructive/10 text-destructive shadow-lg shadow-destructive/30"
+                        : "bg-background/70"
+                    }`}
+                  >
+                    {isIncidentOpening && (
+                      <div className="mb-1 text-[9px] font-bold uppercase tracking-[0.2em] text-destructive">
+                        🚨 Incident opening report
+                      </div>
+                    )}
                     <div className="mb-1 flex gap-2 text-[10px]">
-                      <span className={color(m.from)}>{m.from}</span>
+                      <span
+                        className={isIncidentOpening ? "font-bold text-destructive" : color(m.from)}
+                      >
+                        {m.from}
+                      </span>
                       <span className="text-muted-foreground">→</span>
-                      <span className={color(m.to)}>{m.to}</span>
+                      <span
+                        className={isIncidentOpening ? "font-bold text-destructive" : color(m.to)}
+                      >
+                        {m.to}
+                      </span>
                       <span className="ml-auto text-muted-foreground">{m.t}</span>
                     </div>
                     <div>{m.text}</div>
@@ -791,10 +883,18 @@ export function CommandPanels({
               );
             })}
             {!paused && msgs.length === 0 && (
-              <div className="text-muted-foreground">⟳ Connecting to NVIDIA NIM agents…</div>
+              <div className="text-muted-foreground">
+                {markedEvent
+                  ? `🚨 Incident thread opened — ${markedEvent.icon} ${markedEvent.typeName} at ${markedEvent.locationName}. All 5 agents responding…`
+                  : "⟳ Connecting to NVIDIA NIM agents…"}
+              </div>
             )}
             {!paused && msgs.length > 0 && (
-              <div className="text-muted-foreground">… agents are thinking</div>
+              <div className="text-muted-foreground">
+                {markedEvent
+                  ? `… agents are responding to the ${markedEvent.typeName.toLowerCase()} at ${markedEvent.locationName}`
+                  : "… agents are thinking"}
+              </div>
             )}
             <div ref={chatEnd} />
           </div>
