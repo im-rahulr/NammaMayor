@@ -13,12 +13,37 @@ import { Dialog, DialogContent } from "@/components/ui/dialog";
 import type { NewsItem } from "@/lib/news-rss";
 
 type Feed = { t: string; agent: string; msg: string; tone: "sys" | "agent" | "warn" | "ok" };
+
+export type MarkedEventInfo = {
+  id: string;
+  type: string;
+  typeName: string;
+  icon: string;
+  title: string;
+  locationName: string;
+  lat: number;
+  lng: number;
+  radiusM: number;
+  severity: "CRITICAL" | "HIGH" | "ELEVATED";
+  timestamp: string;
+  description: string;
+  workStatus?: {
+    prediction: string;
+    forecast: string;
+    mobility: string;
+    safety: string;
+    comms: string;
+  };
+};
+
 type Props = {
   feed: Feed[];
   depth: Record<string, number>;
   zones: { id: string; name: string }[];
   live: boolean;
   mode: string;
+  markedEvent?: MarkedEventInfo | null;
+  onClearEvent?: () => void;
 };
 
 const now = () => new Date().toLocaleTimeString("en-GB", { hour12: false });
@@ -278,7 +303,15 @@ function QuestionPanel() {
   );
 }
 
-export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
+export function CommandPanels({
+  feed,
+  depth,
+  zones,
+  live,
+  mode,
+  markedEvent,
+  onClearEvent,
+}: Props) {
   const [msgs, setMsgs] = useState<AgentMessage[]>([]);
   const [logs, setLogs] = useState<Log[]>([]);
   const [paused, setPaused] = useState(false);
@@ -295,6 +328,8 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
   pausedRef.current = paused;
   const modeRef = useRef(mode);
   modeRef.current = mode;
+  const markedEventRef = useRef(markedEvent);
+  markedEventRef.current = markedEvent;
   const [news, setNews] = useState<NewsState>({
     items: [],
     sources: [],
@@ -351,6 +386,17 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
           turnIndex: turnIndexRef.current,
           lastMessage: lastMsgRef.current,
           mode: modeRef.current,
+          markedEvent: markedEventRef.current
+            ? {
+                type: markedEventRef.current.type,
+                typeName: markedEventRef.current.typeName,
+                locationName: markedEventRef.current.locationName,
+                lat: markedEventRef.current.lat,
+                lng: markedEventRef.current.lng,
+                severity: markedEventRef.current.severity,
+                description: markedEventRef.current.description,
+              }
+            : null,
         },
       });
       const [msg] = result.messages;
@@ -372,12 +418,12 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
               ? {
                   t: ts,
                   level: "OK",
-                  text: `Cycle complete. All 5 agents responded. Action logged.`,
+                  text: `Cycle complete. All 5 agents synchronized for active operations.`,
                 }
               : {
                   t: ts,
                   level: "INFO",
-                  text: `${msg.from} → ${msg.to} · ${lat} ms · policy OK`,
+                  text: `${msg.from} → ${msg.to} · ${lat} ms · operational directive OK`,
                 };
         setLogs((l) => [logEntry, ...l].slice(0, 80));
       }
@@ -386,16 +432,44 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
       const msg = err instanceof Error ? err.message : "Agent API error";
       setAgentError(msg);
       setLogs((l) =>
-        [{ t: now(), level: "WARN" as const, text: `Agent API error: ${msg.slice(0, 80)}` }, ...l].slice(
-          0,
-          80,
-        ),
+        [
+          { t: now(), level: "WARN" as const, text: `Agent API note: ${msg.slice(0, 80)}` },
+          ...l,
+        ].slice(0, 80),
       );
-      // Back off: don't advance the turn so the same agent retries next cycle
     } finally {
       busyRef.current = false;
     }
   }, []);
+
+  // When markedEvent updates, reset chat turn cycle to 0 and trigger immediate response!
+  useEffect(() => {
+    if (markedEvent) {
+      setPaused(false);
+      turnIndexRef.current = 0;
+      lastMsgRef.current = "";
+      setLogs((l) => {
+        const entry: Log = {
+          t: now(),
+          level: "WARN",
+          text: `🚨 INCIDENT REPORTED ON MAP: ${markedEvent.icon} ${markedEvent.typeName} at ${markedEvent.locationName}. 5 AI response team engaged!`,
+        };
+        return [entry, ...l].slice(0, 80);
+      });
+      void fireTurn();
+    }
+  }, [markedEvent, fireTurn]);
+
+  useEffect(() => {
+    const delay = live ? LIVE_INTERVAL_MS : PAUSED_CHECK_MS;
+    const id = setInterval(() => {
+      void fireTurn();
+    }, delay);
+    // Fire immediately on mount / mode change
+    void fireTurn();
+    return () => clearInterval(id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [live, fireTurn]);
 
   useEffect(() => {
     const delay = live ? LIVE_INTERVAL_MS : PAUSED_CHECK_MS;
@@ -578,10 +652,13 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
       <QuestionPanel />
 
       {/* AI agents communication */}
-      <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
+      <div id="agent-comms-section" className="grid grid-cols-1 gap-3 xl:grid-cols-3">
         <section className="flex h-[560px] flex-col rounded-sm border bg-card/60 xl:col-span-2">
           <header className="flex items-center justify-between border-b px-4 py-3 font-mono text-xs font-bold tracking-[0.2em]">
-            <span>● AGENT COMMS — 5 AGENTS · NVIDIA NIM LIVE</span>
+            <span className="flex items-center gap-2">
+              <span className="h-2.5 w-2.5 rounded-full bg-accent animate-pulse" />
+              <span>AGENT COMMS — 5 AI AGENTS · SYNCHRONIZED OPERATIONS</span>
+            </span>
             <div className="flex items-center gap-3">
               <div className="hidden gap-2 md:flex">
                 {AGENT_LIST.map((id) => (
@@ -592,12 +669,105 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
               </div>
               <button
                 onClick={() => setPaused((p) => !p)}
-                className="rounded-sm border px-2 py-1 text-[10px]"
+                className="rounded-sm border px-2 py-1 text-[10px] hover:bg-muted"
               >
                 {paused ? "▶ RESUME" : "❚❚ PAUSE"}
               </button>
             </div>
           </header>
+
+          {/* Active Marked Event Response Banner & 5 AI Work Matrix */}
+          {markedEvent ? (
+            <div className="border-b bg-destructive/10 px-4 py-3 font-mono">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-full bg-destructive text-sm shadow-md ring-2 ring-destructive/40 animate-pulse">
+                    {markedEvent.icon}
+                  </span>
+                  <div>
+                    <div className="flex items-center gap-2 text-xs font-bold text-destructive">
+                      <span>RESPONDING TO: {markedEvent.title.toUpperCase()}</span>
+                      <span className="rounded bg-destructive/20 px-1.5 py-0.2 text-[9px] font-extrabold uppercase text-destructive border border-destructive/40">
+                        {markedEvent.severity}
+                      </span>
+                    </div>
+                    <div className="text-[10px] text-muted-foreground">
+                      Location: <b className="text-foreground">{markedEvent.locationName}</b> ({markedEvent.lat.toFixed(4)}, {markedEvent.lng.toFixed(4)}) · Radius: {markedEvent.radiusM}m
+                    </div>
+                  </div>
+                </div>
+
+                {onClearEvent && (
+                  <button
+                    onClick={onClearEvent}
+                    className="rounded border border-destructive/60 bg-background/80 px-2 py-1 text-[10px] text-destructive hover:bg-destructive hover:text-destructive-foreground transition-colors"
+                  >
+                    CLEAR EVENT ✕
+                  </button>
+                )}
+              </div>
+
+              {/* 5 AI Synchronized Working Status Matrix */}
+              <div className="mt-3">
+                <div className="text-[9px] font-bold tracking-widest text-muted-foreground uppercase mb-1 flex items-center justify-between">
+                  <span>⚡ 5 AI AGENTS AT WORK — REAL-TIME TASKS</span>
+                  <span className="text-accent animate-pulse">COLLABORATION ACTIVE</span>
+                </div>
+                <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-2 lg:grid-cols-5 text-[10px]">
+                  <div className="rounded-sm border border-accent/40 bg-background/70 p-2">
+                    <div className="font-bold text-accent flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-accent animate-ping" />
+                      PREDICTION
+                    </div>
+                    <div className="mt-1 text-muted-foreground text-[10px] leading-tight">
+                      {markedEvent.workStatus?.prediction || "Sensor analytics & CCTV stream verified"}
+                    </div>
+                  </div>
+                  <div className="rounded-sm border border-primary/40 bg-background/70 p-2">
+                    <div className="font-bold text-primary flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-primary animate-ping" />
+                      FORECAST
+                    </div>
+                    <div className="mt-1 text-muted-foreground text-[10px] leading-tight">
+                      {markedEvent.workStatus?.forecast || "Containment perimeter modeled"}
+                    </div>
+                  </div>
+                  <div className="rounded-sm border border-success/40 bg-background/70 p-2">
+                    <div className="font-bold text-success flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-success animate-ping" />
+                      MOBILITY
+                    </div>
+                    <div className="mt-1 text-muted-foreground text-[10px] leading-tight">
+                      {markedEvent.workStatus?.mobility || "Arterial detour cordon active"}
+                    </div>
+                  </div>
+                  <div className="rounded-sm border border-destructive/40 bg-background/70 p-2">
+                    <div className="font-bold text-destructive flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-destructive animate-ping" />
+                      SAFETY
+                    </div>
+                    <div className="mt-1 text-muted-foreground text-[10px] leading-tight">
+                      {markedEvent.workStatus?.safety || "Emergency units en route"}
+                    </div>
+                  </div>
+                  <div className="rounded-sm border border-cyan-400/40 bg-background/70 p-2">
+                    <div className="font-bold text-cyan-400 flex items-center gap-1.5">
+                      <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-ping" />
+                      COMMS
+                    </div>
+                    <div className="mt-1 text-muted-foreground text-[10px] leading-tight">
+                      {markedEvent.workStatus?.comms || "Public trilingual broadcast active"}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : (
+            <div className="border-b bg-card/40 px-4 py-2 text-[11px] font-mono text-muted-foreground flex items-center justify-between">
+              <span>STATUS: Routine urban monitoring. Click <b>"MARK EVENT"</b> on the map above to deploy all 5 AI agents to any Bangalore location.</span>
+              <span className="rounded bg-success/20 text-success text-[10px] px-1.5 py-0.5 font-bold">ALL-CLEAR</span>
+            </div>
+          )}
           <div className="flex-1 space-y-3 overflow-y-auto p-4 font-mono text-xs">
             {agentError && (
               <div className="rounded-sm border border-destructive/50 p-2 text-[10px] text-destructive">

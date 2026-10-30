@@ -65,6 +65,143 @@ type Feed = { t: string; agent: string; msg: string; tone: "sys" | "agent" | "wa
 type Dispatch = { id: string; res: Res; zone: Zone; status: "EN ROUTE" | "ON SCENE"; eta: number };
 type Mode = "idle" | "storm" | "gas" | "road";
 
+export type EventTypeItem = {
+  type: "flood" | "gas" | "accident" | "roadblock" | "fire" | "medical";
+  name: string;
+  icon: string;
+  severity: "CRITICAL" | "HIGH" | "ELEVATED";
+  radius: number;
+  desc: string;
+};
+
+export type MarkedEvent = {
+  id: string;
+  type: "flood" | "gas" | "accident" | "roadblock" | "fire" | "medical";
+  typeName: string;
+  icon: string;
+  title: string;
+  locationName: string;
+  lat: number;
+  lng: number;
+  radiusM: number;
+  severity: "CRITICAL" | "HIGH" | "ELEVATED";
+  timestamp: string;
+  description: string;
+  workStatus: {
+    prediction: string;
+    forecast: string;
+    mobility: string;
+    safety: string;
+    comms: string;
+  };
+};
+
+export const EVENT_TYPES: EventTypeItem[] = [
+  {
+    type: "flood",
+    name: "Flood / Inundation",
+    icon: "🌊",
+    severity: "CRITICAL",
+    radius: 400,
+    desc: "Severe stormwater drain overflow, road flooding, and stalled vehicles.",
+  },
+  {
+    type: "gas",
+    name: "Gas Leak / Hazmat",
+    icon: "🔥",
+    severity: "CRITICAL",
+    radius: 500,
+    desc: "Toxic chemical / methane vapor cloud with active wind dispersal.",
+  },
+  {
+    type: "accident",
+    name: "Major Collision",
+    icon: "💥",
+    severity: "HIGH",
+    radius: 250,
+    desc: "Multi-vehicle pileup causing full carriageway blockage and debris.",
+  },
+  {
+    type: "roadblock",
+    name: "Road Cave-in / Block",
+    icon: "🚧",
+    severity: "HIGH",
+    radius: 300,
+    desc: "Subsidence and sinkhole formation, thoroughfare closed to transit.",
+  },
+  {
+    type: "fire",
+    name: "Fire / Industrial Hazard",
+    icon: "⚠️",
+    severity: "CRITICAL",
+    radius: 450,
+    desc: "Rapid flame escalation with heavy particulate dispersion across wards.",
+  },
+  {
+    type: "medical",
+    name: "Mass Casualty / Medical",
+    icon: "🏥",
+    severity: "CRITICAL",
+    radius: 350,
+    desc: "Emergency medical surge requiring on-scene triage and ambulance convoys.",
+  },
+];
+
+export const PRESET_EVENTS = [
+  {
+    id: "silkboard-flood",
+    type: "flood" as const,
+    name: "Flood / Inundation",
+    icon: "🌊",
+    title: "Silk Board Flash Flood",
+    locationName: "Silk Board Junction",
+    lat: 12.9177,
+    lng: 77.6238,
+    radius: 400,
+    severity: "CRITICAL" as const,
+    desc: "ORR underpass submerged with 0.65m water; drain capacity exceeded.",
+  },
+  {
+    id: "hsr-gas",
+    type: "gas" as const,
+    name: "Gas Leak / Hazmat",
+    icon: "🔥",
+    title: "HSR Sector 2 Methane Leak",
+    locationName: "HSR Layout Sector 2",
+    lat: 12.9116,
+    lng: 77.6474,
+    radius: 500,
+    severity: "CRITICAL" as const,
+    desc: "Pipeline breach detected; vapor drifting toward residential clusters.",
+  },
+  {
+    id: "indiranagar-crash",
+    type: "accident" as const,
+    name: "Major Collision",
+    icon: "💥",
+    title: "100ft Indiranagar Pileup",
+    locationName: "Indiranagar 100ft Road",
+    lat: 12.9719,
+    lng: 77.6412,
+    radius: 300,
+    severity: "HIGH" as const,
+    desc: "Bus and multi-car collision halting arterial commercial corridor.",
+  },
+  {
+    id: "bellandur-block",
+    type: "roadblock" as const,
+    name: "Road Cave-in / Block",
+    icon: "🚧",
+    title: "Bellandur Flyover Cave-in",
+    locationName: "Bellandur Outer Ring Road",
+    lat: 12.926,
+    lng: 77.6762,
+    radius: 350,
+    severity: "HIGH" as const,
+    desc: "Carriageway collapse near tech parks requiring peripheral detours.",
+  },
+];
+
 export type LocPoint = { id: string; name: string; lat: number; lng: number; isCustom?: boolean };
 
 export type RouteOption = {
@@ -191,6 +328,7 @@ function Command() {
   const lines = useRef<Leaflet.LayerGroup | null>(null);
   const corridorLayer = useRef<Leaflet.LayerGroup | null>(null);
   const closureLayer = useRef<Leaflet.LayerGroup | null>(null);
+  const eventLayer = useRef<Leaflet.LayerGroup | null>(null);
   const hazard = useRef<Leaflet.Circle | null>(null);
   const roadLayer = useRef<Leaflet.LayerGroup | null>(null);
   const healthLayer = useRef<Leaflet.LayerGroup | null>(null);
@@ -219,6 +357,17 @@ function Command() {
     police: true,
     shelter: true,
   });
+
+  // Marked map event state for the 5 AI agents to chat and work
+  const [markedEvent, setMarkedEvent] = useState<MarkedEvent | null>(null);
+  const [eventMarkMode, setEventMarkMode] = useState(false);
+  const [selectedEventType, setSelectedEventType] = useState<EventTypeItem>(EVENT_TYPES[0]!);
+  const eventMarkModeRef = useRef(eventMarkMode);
+  eventMarkModeRef.current = eventMarkMode;
+  const selectedEventTypeRef = useRef(selectedEventType);
+  selectedEventTypeRef.current = selectedEventType;
+  const markedEventRef = useRef(markedEvent);
+  markedEventRef.current = markedEvent;
 
   // Free Location & Road Closure State
   const [origin, setOrigin] = useState<LocPoint>({
@@ -277,6 +426,75 @@ function Command() {
   const push = useCallback((agent: string, msg: string, tone: Feed["tone"]) => {
     setFeed((f) => [{ t: now(), agent, msg, tone }, ...f].slice(0, 50));
   }, []);
+
+  const handleMarkEvent = useCallback(
+    (lat: number, lng: number, evType: EventTypeItem = selectedEventTypeRef.current) => {
+      const near = findNearestLocation(lat, lng);
+      const distM = Math.round(Math.hypot(near.lat - lat, near.lng - lng) * 111000);
+      const locName = distM < 400 ? near.name : `${near.name} Area (${lat.toFixed(3)}, ${lng.toFixed(3)})`;
+      const title = `${evType.name} at ${near.name}`;
+
+      const workStatus = {
+        prediction: `Sensor node #BLR-${Math.abs(Math.round(lat * 1000)) % 900 + 100} at ${near.name} confirms ${evType.name} anomaly (Confidence: 97%). CCTV feed active.`,
+        forecast: `Simulation models ${evType.radius}m containment envelope around ${near.name}. Projected containment: 30 min. Risk level: ${evType.severity}.`,
+        mobility: `Detour cordon placed on arterial roads to ${near.name}. Re-routing corridor traffic and BMTC fleet via parallel arterial.`,
+        safety: `Dispatched 2 EMS ambulances and 1 rapid rescue patrol to ${near.name}. Staging ETA 5 minutes to perimeter.`,
+        comms: `Emergency cell broadcast issued in Kannada and English to ${near.name} ward residents. Public advisories live.`,
+      };
+
+      const newEv: MarkedEvent = {
+        id: `ev_${Date.now()}`,
+        type: evType.type,
+        typeName: evType.name,
+        icon: evType.icon,
+        title,
+        locationName: locName,
+        lat,
+        lng,
+        radiusM: evType.radius,
+        severity: evType.severity,
+        timestamp: now(),
+        description: evType.desc,
+        workStatus,
+      };
+
+      setMarkedEvent(newEv);
+      setEventMarkMode(false);
+
+      // Deploy emergency units into dispatches
+      const sortedRes = [...RES].sort(
+        (a, b) =>
+          Math.hypot(a.lat - lat, a.lng - lng) - Math.hypot(b.lat - lat, b.lng - lng),
+      );
+      const newDispatches: Dispatch[] = sortedRes.slice(0, 3).map((r, idx) => ({
+        id: `disp_${Date.now()}_${idx}`,
+        res: r,
+        zone: { id: `z_${near.id}`, name: locName, lat, lng, sens: 1.2 },
+        status: idx === 0 ? "ON SCENE" : "EN ROUTE",
+        eta: idx === 0 ? 0 : Math.round(Math.hypot(r.lat - lat, r.lng - lng) * 111 * 2.8),
+      }));
+      setDispatches(newDispatches);
+
+      // Push 5 AI operational feed updates
+      push("SYS", `🚨 NEW MAP EVENT MARKED: ${evType.icon} ${title}. Engaging all 5 AI agents...`, "warn");
+      push("PREDICTION", workStatus.prediction, "warn");
+      push("FORECAST", workStatus.forecast, "agent");
+      push("MOBILITY", workStatus.mobility, "agent");
+      push("SAFETY", workStatus.safety, "warn");
+      push("COMMS", workStatus.comms, "ok");
+
+      map.current?.flyTo([lat, lng], 15, { duration: 1.2 });
+    },
+    [push],
+  );
+
+  const handleClearEvent = useCallback(() => {
+    setMarkedEvent(null);
+    setEventMarkMode(false);
+    eventLayer.current?.clearLayers();
+    setDispatches([]);
+    push("SYS", "Map event cleared. 5 AI agents stand down and return to routine monitoring.", "ok");
+  }, [push]);
 
   // clock + boot
   useEffect(() => {
@@ -372,25 +590,25 @@ function Command() {
           return;
         }
 
-        // 2. Road blockage check using 140m threshold (targeted to actual road width)
+        // 2. Road blockage check: 260m threshold strictly matches the hazard perimeter
         const isRouteBlocked = (coords: [number, number][]) =>
-          minDistanceToRoute(closurePoint, coords) < 140;
+          minDistanceToRoute(closurePoint, coords) < 260;
 
         const baseIsBlocked = isRouteBlocked(base.coords);
 
-        // If the direct fastest route is NOT on the closed segment, keep direct routes as primary!
-        if (!baseIsBlocked) {
-          // Filter out any alternative that hits the closure
-          const cleanDirect = parsedDirect.filter((r) => !isRouteBlocked(r.coords));
-          setRoutes(cleanDirect.length ? cleanDirect : [base]);
+        // Filter all direct routes: strictly eliminate any route that passes through the closure
+        const cleanDirect = parsedDirect.filter((r) => !isRouteBlocked(r.coords));
+
+        // If the direct route is NOT blocked, use only unblocked direct routes
+        if (!baseIsBlocked && cleanDirect.length) {
+          setRoutes(cleanDirect);
           setIsCalculating(false);
           return;
         }
 
-        // 3. Primary route IS blocked: find real alternatives avoiding the closure
-        const unblockedAlts = parsedDirect.filter((r, idx) => idx > 0 && !isRouteBlocked(r.coords));
+        // 3. Primary route IS blocked: find real arterial detour routes avoiding the closure
+        const unblockedAlts = cleanDirect;
 
-        // Find key city arterial junctions for detours (only corridors with reasonable distance ratio)
         const originDist = (loc: CityLocation) =>
           Math.hypot(loc.lat - origin.lat, loc.lng - origin.lng);
         const destDist = (loc: CityLocation) =>
@@ -401,16 +619,16 @@ function Command() {
           if (loc.id === origin.id || loc.id === destination.id) return false;
           const distToClosureM =
             Math.hypot(loc.lat - closurePoint.lat, loc.lng - closurePoint.lng) * 111000;
-          if (distToClosureM < 350) return false;
+          if (distToClosureM < 450) return false; // Must be well clear of the closure
           const ratio = (originDist(loc) + destDist(loc)) / (directDist || 0.01);
-          return ratio < 1.65;
+          return ratio < 1.85;
         })
           .sort((a, b) => {
             const ratioA = (originDist(a) + destDist(a)) / (directDist || 0.01);
             const ratioB = (originDist(b) + destDist(b)) / (directDist || 0.01);
             return ratioA - ratioB;
           })
-          .slice(0, 5);
+          .slice(0, 8);
 
         const bypassPromises = candidateCorridors.map(async (loc, i) => {
           const rts = await osrmFetch([origin, loc, destination]);
@@ -423,6 +641,7 @@ function Command() {
             `Detour via ${shortName}`,
             `via ${shortName}`,
           );
+          // Strictly reject if this route enters the 260m closure perimeter
           if (isRouteBlocked(route.coords)) return null;
           return route;
         });
@@ -430,7 +649,10 @@ function Command() {
         const bypassResults = (await Promise.all(bypassPromises)).filter(Boolean) as RouteOption[];
         if (cancelled) return;
 
-        const combined = [...unblockedAlts, ...bypassResults];
+        // Combine only routes that strictly avoid the closed segment
+        const combined = [...unblockedAlts, ...bypassResults].filter(
+          (r) => !isRouteBlocked(r.coords),
+        );
         combined.sort((a, b) => a.durationMin - b.durationMin);
 
         const unique: RouteOption[] = [];
@@ -549,10 +771,17 @@ function Command() {
       healthLayer.current = lf.layerGroup().addTo(m);
       corridorLayer.current = lf.layerGroup().addTo(m);
       closureLayer.current = lf.layerGroup().addTo(m);
+      eventLayer.current = lf.layerGroup().addTo(m);
       lines.current = lf.layerGroup().addTo(m);
       roadRenderer.current = lf.canvas({ padding: 0.3 });
 
       m.on("click", (e: Leaflet.LeafletMouseEvent) => {
+        // Priority: If event marker mode is toggled, always mark event
+        if (eventMarkModeRef.current) {
+          handleMarkEvent(e.latlng.lat, e.latlng.lng, selectedEventTypeRef.current);
+          return;
+        }
+
         if (modeRef.current === "road") {
           const clickMode = mapPickModeRef.current;
           const pos = e.latlng;
@@ -626,6 +855,9 @@ function Command() {
           return;
         }
 
+        // When in general monitoring/standby, clicking anywhere on the map marks an event!
+        handleMarkEvent(e.latlng.lat, e.latlng.lng, selectedEventTypeRef.current);
+
         if (showRoadsRef.current && roadsRef.current) {
           setPickedRoad(nearestRoad(roadsRef.current.roads, e.latlng.lat, e.latlng.lng));
         }
@@ -642,6 +874,8 @@ function Command() {
       lines.current = null;
       corridorLayer.current = null;
       closureLayer.current = null;
+      eventLayer.current?.clearLayers();
+      eventLayer.current = null;
       roadLayer.current = null;
       healthLayer.current = null;
       roadRenderer.current = null;
@@ -650,7 +884,7 @@ function Command() {
       circles.current = {};
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [push]);
+  }, [push, handleMarkEvent]);
 
   // Zone circle rendering (hidden completely in road mode to remove mock marks data)
   const paint = useCallback((d: Record<string, number>) => {
@@ -721,17 +955,20 @@ function Command() {
 
     // 2. Draw active/selected route (Electric Blue navigation color — no green)
     const activeRoute = routes[activeAltIndex] ?? routes[0];
-    if (activeRoute) {
+    let animationTimer: ReturnType<typeof setInterval> | null = null;
+    if (activeRoute && activeRoute.coords.length > 1) {
       const isPrimary = activeAltIndex === 0;
       const col = "#2563eb"; // Electric Blue navigation color
+
       // Outer glow
       lf.polyline(activeRoute.coords, {
         color: "#3b82f6",
         weight: 12,
-        opacity: 0.35,
+        opacity: 0.3,
         interactive: false,
       }).addTo(cl);
-      // Main line
+
+      // Base solid road line
       lf.polyline(activeRoute.coords, {
         color: col,
         weight: 6,
@@ -744,6 +981,39 @@ function Command() {
           `${isPrimary ? (closurePoint ? "★ RECOMMENDED DETOUR" : "★ FASTEST ROUTE") : `ALT ${activeAltIndex + 1}`} · ${activeRoute.durationMin.toFixed(1)} min · ${activeRoute.distanceKm.toFixed(1)} km`,
           { sticky: true },
         );
+
+      // Animated tracer flow line on top (Wolfram-style Dijkstra pulse flow)
+      lf.polyline(activeRoute.coords, {
+        color: "#93c5fd",
+        weight: 3,
+        opacity: 0.9,
+        className: "route-flow-line",
+        interactive: false,
+      }).addTo(cl);
+
+      // Moving path tracer robot/particle along the coordinates
+      const tracerIcon = lf.divIcon({
+        className: "",
+        html: `<div class="relative flex h-5 w-5 items-center justify-center">
+          <div class="absolute h-5 w-5 rounded-full bg-sky-400 tracer-beacon"></div>
+          <div class="h-2.5 w-2.5 rounded-full bg-white shadow-md border border-sky-600"></div>
+        </div>`,
+        iconSize: [20, 20],
+        iconAnchor: [10, 10],
+      });
+
+      const tracer = lf
+        .marker(activeRoute.coords[0]!, { icon: tracerIcon, interactive: false })
+        .addTo(cl);
+      let step = 0;
+      const totalSteps = activeRoute.coords.length;
+      animationTimer = setInterval(() => {
+        step = (step + 1) % totalSteps;
+        const pt = activeRoute.coords[step];
+        if (pt) {
+          tracer.setLatLng(pt);
+        }
+      }, 140);
     }
 
     // 3. Draw Road Closure marker (if any)
@@ -779,9 +1049,9 @@ function Command() {
         push("MOBILITY", `Closure dragged to: ${near.name} Road. Recomputing routes...`, "warn");
       });
 
-      // Red hazard circle around closure (150m road segment radius)
+      // Red hazard circle around closure (matches 260m exclusion perimeter)
       lf.circle([closurePoint.lat, closurePoint.lng], {
-        radius: 150,
+        radius: 260,
         color: "#ef4444",
         fillColor: "#ef4444",
         fillOpacity: 0.18,
@@ -861,7 +1131,131 @@ function Command() {
       });
       push("MOBILITY", `Destination dragged to: ${near.name}. Updating route...`, "agent");
     });
+
+    return () => {
+      if (animationTimer) clearInterval(animationTimer);
+    };
   }, [mode, routes, activeAltIndex, origin, destination, closurePoint, push]);
+
+  // Render Marked Event layer (Hazard perimeter, pulsating icon, Safety AI emergency dispatch lines, Mobility detour ring)
+  useEffect(() => {
+    const lf = L.current;
+    const el = eventLayer.current;
+    if (!lf || !el) return;
+
+    el.clearLayers();
+
+    if (!markedEvent) return;
+
+    // 1. Animated marker for marked event
+    const evIcon = lf.divIcon({
+      className: "custom-event-pin",
+      html: `
+        <div class="relative flex items-center justify-center cursor-pointer">
+          <span class="absolute h-14 w-14 rounded-full bg-red-500/40 animate-ping"></span>
+          <span class="absolute h-10 w-10 rounded-full bg-red-600/60 animate-pulse"></span>
+          <div class="relative flex h-9 w-9 items-center justify-center rounded-full bg-red-600 border-2 border-white text-base font-bold text-white shadow-2xl">
+            ${markedEvent.icon}
+          </div>
+        </div>
+      `,
+      iconSize: [36, 36],
+      iconAnchor: [18, 18],
+    });
+
+    const marker = lf
+      .marker([markedEvent.lat, markedEvent.lng], {
+        icon: evIcon,
+        draggable: true,
+      })
+      .addTo(el);
+
+    marker.bindTooltip(
+      `<div style="font-family: monospace; font-size: 11px;">
+        <b>${markedEvent.icon} ${markedEvent.title}</b><br/>
+        <span style="color: #f87171; font-weight: bold;">SEVERITY: ${markedEvent.severity}</span><br/>
+        <span style="color: #94a3b8; font-size: 10px;">Drag pin to move · 5 AI Agents Active</span>
+      </div>`,
+      { permanent: true, direction: "top", offset: [0, -18] },
+    );
+
+    marker.on("dragend", (e: Leaflet.LeafletEvent) => {
+      const tgt = e.target as Leaflet.Marker;
+      const pos = tgt.getLatLng();
+      handleMarkEvent(pos.lat, pos.lng, selectedEventTypeRef.current);
+    });
+
+    // 2. Hazard Perimeter Circle (Prediction / Forecast AI)
+    lf.circle([markedEvent.lat, markedEvent.lng], {
+      radius: markedEvent.radiusM,
+      color: "#ef4444",
+      fillColor: "#ef4444",
+      fillOpacity: 0.22,
+      weight: 2,
+      dashArray: "6 6",
+    })
+      .addTo(el)
+      .bindTooltip(`FORECAST AI: Hazard perimeter ${markedEvent.radiusM}m around ${markedEvent.locationName}`);
+
+    // 3. Mobility AI Detour Buffer / Cordon
+    lf.circle([markedEvent.lat, markedEvent.lng], {
+      radius: markedEvent.radiusM + 180,
+      color: "#22c55e",
+      fillColor: "#22c55e",
+      fillOpacity: 0.06,
+      weight: 1.5,
+      dashArray: "4 8",
+    })
+      .addTo(el)
+      .bindTooltip(`MOBILITY AI: Arterial diversion cordon`);
+
+    // 4. Safety AI Emergency Dispatches: Find 2 closest emergency stations
+    const sortedRes = [...RES].sort(
+      (a, b) =>
+        Math.hypot(a.lat - markedEvent.lat, a.lng - markedEvent.lng) -
+        Math.hypot(b.lat - markedEvent.lat, b.lng - markedEvent.lng),
+    );
+
+    sortedRes.slice(0, 2).forEach((res) => {
+      const distKm = Math.hypot(res.lat - markedEvent.lat, res.lng - markedEvent.lng) * 111;
+      const etaMin = Math.max(3, Math.round(distKm * 2.8));
+
+      // Draw dashed dispatch polyline
+      lf.polyline(
+        [
+          [res.lat, res.lng],
+          [markedEvent.lat, markedEvent.lng],
+        ],
+        {
+          color: res.kind === "hospital" ? "#10b981" : "#f59e0b",
+          weight: 3,
+          dashArray: "6 6",
+          opacity: 0.85,
+        },
+      )
+        .addTo(el)
+        .bindTooltip(
+          `SAFETY AI DISPATCH: ${res.name} → ${markedEvent.locationName} · ETA ${etaMin} min`,
+          { sticky: true },
+        );
+
+      // Midpoint vehicle badge
+      const midLat = (res.lat + markedEvent.lat) / 2;
+      const midLng = (res.lng + markedEvent.lng) / 2;
+      const unitIcon = lf.divIcon({
+        className: "",
+        html: `
+          <div class="flex items-center gap-1 rounded bg-background/90 px-1.5 py-0.5 border border-primary/60 text-[9px] font-mono font-bold text-foreground shadow">
+            <span>${res.kind === "hospital" ? "🚑" : "🚓"}</span>
+            <span>ETA ${etaMin}m</span>
+          </div>
+        `,
+        iconSize: [60, 20],
+        iconAnchor: [30, 10],
+      });
+      lf.marker([midLat, midLng], { icon: unitIcon, interactive: false }).addTo(el);
+    });
+  }, [markedEvent, handleMarkEvent]);
 
   // Real BBMP layers: lazy-load on first enable
   useEffect(() => {
@@ -1313,30 +1707,38 @@ function Command() {
             </span>
             <span className="hidden text-muted-foreground md:inline">
               Bangalore ·{" "}
-              {live
-                ? mode === "storm"
-                  ? "Monsoon event"
-                  : mode === "road"
-                    ? "Road Closure Studio"
-                    : stage === 2
-                      ? "Gas leak · STAGE 2"
-                      : "Gas leak"
-                : "Standby"}
+              {markedEvent
+                ? `${markedEvent.typeName} marked`
+                : live
+                  ? mode === "storm"
+                    ? "Monsoon event"
+                    : mode === "road"
+                      ? "Road Closure Studio"
+                      : stage === 2
+                        ? "Gas leak · STAGE 2"
+                        : "Gas leak"
+                  : "Standby"}
             </span>
           </div>
           <div className="flex items-center gap-2 tracking-[0.2em]">
             <span
-              className={`h-2 w-2 rounded-full ${live ? "bg-destructive pulse-ring" : "bg-success"}`}
+              className={`h-2 w-2 rounded-full ${live || markedEvent ? "bg-destructive pulse-ring" : "bg-success"}`}
             />
-            {live ? (
+            {live || markedEvent ? (
               <span className="text-destructive">
-                LIVE {mode === "road" ? "· CLOSURE PLANNER" : `· T+${tick}`}
+                LIVE {markedEvent ? "· 5 AI RESPONDING" : mode === "road" ? "· CLOSURE PLANNER" : `· T+${tick}`}
               </span>
             ) : (
               "STANDBY"
             )}
           </div>
           <div className="flex items-center gap-3">
+            <Link
+              to="/events"
+              className="rounded-sm border border-border px-3 py-1.5 text-muted-foreground transition-colors hover:border-accent hover:text-accent"
+            >
+              EVENTS →
+            </Link>
             <span className="text-muted-foreground">{clock} IST</span>
             <button
               onClick={() => run("storm")}
@@ -1351,6 +1753,90 @@ function Command() {
         <div className="flex min-h-0 flex-1">
           {/* left */}
           <aside className="flex w-80 shrink-0 flex-col gap-4 overflow-y-auto border-r bg-card/60 p-4">
+            {/* 🚨 MARK MAP EVENT STUDIO FOR 5 AI */}
+            <div className="space-y-3 rounded-sm border border-destructive/60 bg-destructive/10 p-3 font-mono text-xs shadow-md">
+              <div className="flex items-center justify-between">
+                <span className="font-bold text-destructive flex items-center gap-1.5">
+                  <span className="h-2 w-2 rounded-full bg-destructive animate-ping" />
+                  🚨 MARK MAP EVENT
+                </span>
+                {markedEvent && (
+                  <button
+                    onClick={handleClearEvent}
+                    className="text-[10px] text-muted-foreground hover:text-destructive underline"
+                  >
+                    Clear
+                  </button>
+                )}
+              </div>
+
+              <div className="text-[10px] text-muted-foreground leading-relaxed">
+                Click below, then click any location on the map. The 5 AI agents will immediately mobilize, coordinate in chat, and deploy dispatches.
+              </div>
+
+              <button
+                onClick={() => setEventMarkMode((prev) => !prev)}
+                className={`w-full py-2.5 px-3 rounded-sm font-bold tracking-wider text-xs transition-all flex items-center justify-center gap-2 ${
+                  eventMarkMode
+                    ? "bg-destructive text-destructive-foreground shadow-lg shadow-destructive/50 animate-pulse border-2 border-white"
+                    : "bg-destructive/20 border border-destructive/60 text-destructive hover:bg-destructive hover:text-destructive-foreground"
+                }`}
+              >
+                <span>{eventMarkMode ? "🎯 CLICK MAP TO DROP PIN..." : "📍 ACTIVATE EVENT MARKER"}</span>
+              </button>
+
+              <div className="space-y-1">
+                <div className="text-[9px] font-bold text-muted-foreground tracking-wider uppercase">
+                  Incident Category:
+                </div>
+                <div className="grid grid-cols-2 gap-1.5">
+                  {EVENT_TYPES.map((et) => (
+                    <button
+                      key={et.type}
+                      onClick={() => {
+                        setSelectedEventType(et);
+                        if (!eventMarkMode) setEventMarkMode(true);
+                      }}
+                      className={`p-1.5 rounded-sm border text-left text-[10px] transition-colors ${
+                        selectedEventType.type === et.type
+                          ? "border-destructive bg-destructive/30 text-white font-bold"
+                          : "border-border/60 hover:bg-muted text-muted-foreground"
+                      }`}
+                    >
+                      <span className="mr-1">{et.icon}</span>
+                      {et.name.split("/")[0]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-1 pt-1 border-t border-border/40">
+                <div className="text-[9px] font-bold text-muted-foreground tracking-wider uppercase">
+                  Quick Presets (1-Click Test):
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {PRESET_EVENTS.map((pe) => (
+                    <button
+                      key={pe.id}
+                      onClick={() =>
+                        handleMarkEvent(pe.lat, pe.lng, {
+                          type: pe.type,
+                          name: pe.name,
+                          icon: pe.icon,
+                          severity: pe.severity,
+                          radius: pe.radius,
+                          desc: pe.desc,
+                        })
+                      }
+                      className="px-2 py-1 rounded-sm border border-border/60 text-[10px] hover:border-destructive/80 hover:bg-destructive/20 text-muted-foreground hover:text-foreground transition-colors"
+                    >
+                      {pe.icon} {pe.locationName.split(" ")[0]}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            </div>
+
             <button
               onClick={() => run("gas")}
               disabled={live && mode !== "gas"}
@@ -1891,8 +2377,107 @@ function Command() {
           </aside>
 
           {/* map */}
-          <div className="relative min-w-0 flex-1">
+          <div className={`relative min-w-0 flex-1 ${eventMarkMode ? "cursor-crosshair" : ""}`}>
             <div ref={mapEl} className="h-full w-full bg-background" />
+
+            {/* Hint overlay for event marker mode */}
+            {eventMarkMode && (
+              <div className="absolute top-4 left-1/2 -translate-x-1/2 z-[500] rounded-sm border-2 border-destructive bg-card/95 px-4 py-2 font-mono text-xs shadow-2xl flex items-center gap-3 backdrop-blur animate-pulse">
+                <span className="h-2.5 w-2.5 rounded-full bg-destructive animate-ping" />
+                <span>
+                  🎯 <b>EVENT MARKER ACTIVE:</b> Click anywhere on Bangalore map to mark{" "}
+                  <span className="text-destructive font-bold">{selectedEventType.icon} {selectedEventType.name}</span>
+                </span>
+                <button
+                  onClick={() => setEventMarkMode(false)}
+                  className="rounded-sm border border-destructive/50 px-2 py-0.5 text-[10px] hover:bg-muted"
+                >
+                  Cancel
+                </button>
+              </div>
+            )}
+
+            {/* Marked Event Active Floating Response Matrix */}
+            {markedEvent && !eventMarkMode && (
+              <div className="absolute top-4 left-4 right-52 z-[500] rounded-sm border border-destructive/60 bg-card/95 p-3 shadow-2xl backdrop-blur font-mono text-xs">
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b pb-2">
+                  <div className="flex items-center gap-2">
+                    <span className="flex h-7 w-7 items-center justify-center rounded-full bg-destructive text-white animate-pulse shadow-md">
+                      {markedEvent.icon}
+                    </span>
+                    <div>
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-destructive">
+                          MAP EVENT ACTIVE: {markedEvent.title.toUpperCase()}
+                        </span>
+                        <span className="rounded bg-destructive/20 px-1.5 py-0.2 text-[9px] font-extrabold text-destructive border border-destructive/40">
+                          {markedEvent.severity}
+                        </span>
+                      </div>
+                      <div className="text-[10px] text-muted-foreground">
+                        Location: <b className="text-foreground">{markedEvent.locationName}</b> ({markedEvent.lat.toFixed(4)}, {markedEvent.lng.toFixed(4)}) · 5 AI Agents synchronizing response
+                      </div>
+                    </div>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={() => {
+                        const el = document.getElementById("agent-comms-section");
+                        if (el) el.scrollIntoView({ behavior: "smooth" });
+                      }}
+                      className="rounded-sm border border-accent bg-accent/20 px-2.5 py-1 text-[10px] font-bold text-accent hover:bg-accent hover:text-accent-foreground transition-colors"
+                    >
+                      💬 VIEW 5 AI CHAT & WORK ↓
+                    </button>
+                    <button
+                      onClick={handleClearEvent}
+                      className="rounded-sm border border-border px-2 py-1 text-[10px] text-muted-foreground hover:border-destructive hover:text-destructive transition-colors"
+                    >
+                      CLEAR EVENT ✕
+                    </button>
+                  </div>
+                </div>
+
+                {/* 5 AI Work Status Matrix on Map */}
+                <div className="mt-2 grid grid-cols-1 gap-1.5 sm:grid-cols-5 text-[10px]">
+                  <div className="rounded border border-accent/40 bg-background/60 p-1.5">
+                    <span className="font-bold text-accent flex items-center gap-1">
+                      <span className="h-1.5 w-1.5 rounded-full bg-accent animate-ping" />
+                      PREDICTION AI
+                    </span>
+                    <div className="text-muted-foreground mt-0.5 line-clamp-2 leading-tight">{markedEvent.workStatus.prediction}</div>
+                  </div>
+                  <div className="rounded border border-primary/40 bg-background/60 p-1.5">
+                    <span className="font-bold text-primary flex items-center gap-1">
+                      <span className="h-1.5 w-1.5 rounded-full bg-primary animate-ping" />
+                      FORECAST AI
+                    </span>
+                    <div className="text-muted-foreground mt-0.5 line-clamp-2 leading-tight">{markedEvent.workStatus.forecast}</div>
+                  </div>
+                  <div className="rounded border border-success/40 bg-background/60 p-1.5">
+                    <span className="font-bold text-success flex items-center gap-1">
+                      <span className="h-1.5 w-1.5 rounded-full bg-success animate-ping" />
+                      MOBILITY AI
+                    </span>
+                    <div className="text-muted-foreground mt-0.5 line-clamp-2 leading-tight">{markedEvent.workStatus.mobility}</div>
+                  </div>
+                  <div className="rounded border border-destructive/40 bg-background/60 p-1.5">
+                    <span className="font-bold text-destructive flex items-center gap-1">
+                      <span className="h-1.5 w-1.5 rounded-full bg-destructive animate-ping" />
+                      SAFETY AI
+                    </span>
+                    <div className="text-muted-foreground mt-0.5 line-clamp-2 leading-tight">{markedEvent.workStatus.safety}</div>
+                  </div>
+                  <div className="rounded border border-cyan-400/40 bg-background/60 p-1.5">
+                    <span className="font-bold text-cyan-400 flex items-center gap-1">
+                      <span className="h-1.5 w-1.5 rounded-full bg-cyan-400 animate-ping" />
+                      COMMS AI
+                    </span>
+                    <div className="text-muted-foreground mt-0.5 line-clamp-2 leading-tight">{markedEvent.workStatus.comms}</div>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {/* Hint overlay for picking mode */}
             {mode === "road" && mapPickMode !== "none" && (
@@ -2252,7 +2837,15 @@ function Command() {
           </aside>
         </div>
       </div>
-      <CommandPanels feed={feed} depth={depth} zones={ZONES} live={live} mode={mode} />
+      <CommandPanels
+        feed={feed}
+        depth={depth}
+        zones={ZONES}
+        live={live || !!markedEvent}
+        mode={mode}
+        markedEvent={markedEvent}
+        onClearEvent={handleClearEvent}
+      />
     </div>
   );
 }

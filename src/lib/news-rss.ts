@@ -153,7 +153,7 @@ export function mergeFeeds(feeds: NewsItem[][], limit = 12): NewsItem[] {
 
   for (const feed of feeds) {
     for (const item of feed) {
-      const key = normalizeKey(item.title);
+      const key = normalizeKey(item.title) || item.id || item.url;
       if (!key || seen.has(key)) continue;
       seen.add(key);
       merged.push(item);

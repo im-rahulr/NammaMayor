@@ -12,4 +12,14 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  vite: {
+    server: {
+      // Build output (`.output`, `dist`, `.nitro`) is written and replaced by builds.
+      // Watching it makes chokidar's directory scan fail with an unhandled "scandir"
+      // error on Windows, which takes the whole dev server down.
+      watch: {
+        ignored: [/[\\/]\.output[\\/]/, /[\\/]dist[\\/]/, /[\\/]\.nitro[\\/]/],
+      },
+    },
+  },
 });

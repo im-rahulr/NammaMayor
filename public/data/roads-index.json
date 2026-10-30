@@ -1,0 +1,31 @@
+{
+  "meta": {
+    "source": "BBMP Bengaluru Road Width Map (KML)",
+    "generatedAt": "2026-10-30T16:44:45.964Z",
+    "units": { "width": "m", "length": "m", "coordinates": "lng,lat" },
+    "segments": 23313,
+    "vertices": 124363,
+    "totalKm": 2241.2,
+    "bounds": [77.40334, 12.79726, 77.78713, 13.17546],
+    "hierarchies": ["MI", "PU", "MA", "IR", "OR", "PR", "CR"],
+    "types": ["C", "W", "NA"],
+    "hierarchyCounts": {
+      "MI": 8908,
+      "PU": 2679,
+      "MA": 10598,
+      "IR": 387,
+      "OR": 492,
+      "PR": 4,
+      "CR": 245
+    },
+    "widthHistogram": {
+      "w18": 1121,
+      "w45": 1214,
+      "w24": 4975,
+      "w12": 7752,
+      "w30": 5205,
+      "w60": 3046
+    },
+    "widthRange": { "min": 12, "max": 100 }
+  }
+}

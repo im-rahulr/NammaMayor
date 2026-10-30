@@ -1,0 +1,61 @@
+{
+  "nodes": [
+    { "id": "SILK", "name": "Silk Board Junction", "lat": 12.9177, "lng": 77.6238 },
+    { "id": "AGARA", "name": "Agara Junction", "lat": 12.9235, "lng": 77.6431 },
+    { "id": "HSR27", "name": "HSR 27th Main", "lat": 12.9142, "lng": 77.6529 },
+    { "id": "HSR", "name": "HSR Layout", "lat": 12.9116, "lng": 77.6474 },
+    { "id": "SARJ", "name": "Sarjapur Road", "lat": 12.9105, "lng": 77.673 },
+    { "id": "BELL", "name": "Bellandur", "lat": 12.926, "lng": 77.6762 },
+    { "id": "KORA", "name": "Koramangala", "lat": 12.9352, "lng": 77.6245 },
+    { "id": "BTM", "name": "BTM Layout", "lat": 12.9166, "lng": 77.6101 },
+    { "id": "MADI", "name": "Madiwala", "lat": 12.9225, "lng": 77.6155 },
+    { "id": "HOSUR", "name": "Hosur Rd", "lat": 12.905, "lng": 77.62 },
+    { "id": "ELEC", "name": "Electronic City", "lat": 12.845, "lng": 77.66 }
+  ],
+  "edges": [
+    { "id": "E1", "from": "SILK", "to": "AGARA", "minutes": 5.6, "km": 2.91, "road": "ORR EB" },
+    { "id": "E2", "from": "AGARA", "to": "BELL", "minutes": 5.5, "km": 4.53, "road": "ORR EB" },
+    { "id": "E3", "from": "SILK", "to": "HSR", "minutes": 4.5, "km": 2.4, "road": "HSR Main Rd" },
+    { "id": "E4", "from": "HSR", "to": "HSR27", "minutes": 2.0, "km": 1.1, "road": "27th Main" },
+    { "id": "E5", "from": "HSR27", "to": "AGARA", "minutes": 3.0, "km": 1.6, "road": "Agara Link" },
+    {
+      "id": "E6",
+      "from": "HSR27",
+      "to": "BELL",
+      "minutes": 6.0,
+      "km": 3.2,
+      "road": "HSR-Bellandur"
+    },
+    {
+      "id": "E7",
+      "from": "SILK",
+      "to": "SARJ",
+      "minutes": 6.0,
+      "km": 4.0,
+      "road": "Sarjapur Rd (via HSR)"
+    },
+    { "id": "E8", "from": "SARJ", "to": "BELL", "minutes": 4.0, "km": 2.5, "road": "Sarjapur Rd" },
+    {
+      "id": "E9",
+      "from": "SILK",
+      "to": "KORA",
+      "minutes": 4.0,
+      "km": 2.2,
+      "road": "Koramangala Rd"
+    },
+    {
+      "id": "E10",
+      "from": "KORA",
+      "to": "BELL",
+      "minutes": 12.0,
+      "km": 7.0,
+      "road": "Koramangala-Bellandur"
+    },
+    { "id": "E11", "from": "SILK", "to": "BTM", "minutes": 3.0, "km": 1.8, "road": "BTM Link" },
+    { "id": "E12", "from": "BTM", "to": "BELL", "minutes": 22.0, "km": 15.0, "road": "via BTM" },
+    { "id": "E13", "from": "SILK", "to": "MADI", "minutes": 2.5, "km": 1.4, "road": "Madiwala Rd" },
+    { "id": "E14", "from": "MADI", "to": "HOSUR", "minutes": 3.0, "km": 1.8, "road": "Hosur Rd" },
+    { "id": "E15", "from": "HOSUR", "to": "ELEC", "minutes": 18.0, "km": 14.0, "road": "Hosur Rd" },
+    { "id": "E16", "from": "AGARA", "to": "HSR", "minutes": 3.5, "km": 1.9, "road": "Agara-HSR" }
+  ]
+}

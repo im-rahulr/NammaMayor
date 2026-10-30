@@ -2,7 +2,7 @@ import { createServerFn } from "@tanstack/react-start";
 
 import { mergeFeeds, parseRss, topSources, type NewsItem } from "./news-rss";
 
-export type NewsMode = "idle" | "storm" | "gas";
+export type NewsMode = "idle" | "storm" | "gas" | "road";
 
 export type NewsPayload = {
   items: NewsItem[];
@@ -11,7 +11,7 @@ export type NewsPayload = {
   updatedAt: string;
 };
 
-const MODES: NewsMode[] = ["idle", "storm", "gas"];
+const MODES: NewsMode[] = ["idle", "storm", "gas", "road"];
 
 // City-ops queries per operating mode. Google News RSS is free and needs no key.
 const QUERIES: Record<NewsMode, string[]> = {
@@ -33,6 +33,12 @@ const QUERIES: Record<NewsMode, string[]> = {
     "Bengaluru HSR Layout when:7d",
     "Bengaluru when:7d",
   ],
+  road: [
+    "Bengaluru road closure diversion when:7d",
+    "Bengaluru traffic ORR construction when:7d",
+    "Bengaluru BMTC reroute when:7d",
+    "Bengaluru when:7d",
+  ],
 };
 
 const FEED_TTL_MS = 120_000;
@@ -49,6 +55,7 @@ const MODE_TERMS: Record<NewsMode, RegExp> = {
   storm:
     /\brain|\bflood|\bwaterlog|\bstorm|\bcyclone|\bweather|\bimd\b|\bdownpour|\bmonsoon|\bdrain|\balert/i,
   gas: /\bgas\b|\bleak|\bfire\b|\bblast|\bexplosion|\bsmoke|\bhazard|\bevacuat|\bcordon|\bcylinder/i,
+  road: /\broad\b|\btraffic\b|\bdiversion\b|\bclosure\b|\bcongestion\b|\bconstruction\b|\bgridlock\b/i,
 };
 
 const cache = new Map<NewsMode, { at: number; payload: NewsPayload }>();
@@ -85,17 +92,44 @@ async function fetchFeed(query: string): Promise<NewsItem[]> {
   }
 }
 
+async function fetchDirectFeed(url: string): Promise<NewsItem[]> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  try {
+    const response = await fetch(url, {
+      signal: controller.signal,
+      headers: {
+        accept: "application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.5",
+        "user-agent": "NammaMayorOS/2.0 (+city operations dashboard)",
+      },
+    });
+    if (!response.ok) throw new Error(`RSS ${response.status} for "${url}"`);
+    return parseRss(await response.text(), 40);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function loadNews(mode: NewsMode): Promise<NewsPayload> {
   const cached = cache.get(mode);
   if (cached && Date.now() - cached.at < FEED_TTL_MS) return cached.payload;
 
   const queries = QUERIES[mode];
-  const feeds = await Promise.allSettled(queries.map(fetchFeed));
+  const ndma = fetchDirectFeed(
+    "https://sachet.ndma.gov.in/cap_public_website/rss/rss_karnataka.xml",
+  );
+  const feeds = await Promise.allSettled([...queries.map(fetchFeed), ndma]);
   const fulfilled = feeds.filter(
     (f): f is PromiseFulfilledResult<NewsItem[]> => f.status === "fulfilled",
   );
+
+  // NDMA CAP alerts are authoritative — show them first, regardless of age or city keywords.
+  const isNdma = (item: NewsItem) =>
+    item.source.includes("sachet.ndma.gov.in") || item.url.includes("sachet.ndma.gov.in");
+  const ndmaItems = fulfilled.flatMap((f) => f.value).filter(isNdma);
+
   const items = mergeFeeds(
-    fulfilled.map((f) => f.value),
+    fulfilled.map((f) => f.value.filter((item) => !isNdma(item))),
     100,
   );
 
@@ -106,7 +140,7 @@ async function loadNews(mode: NewsMode): Promise<NewsPayload> {
   // Drop stale results, but never pad the list with out-of-city headlines.
   const cutoff = Date.now() - MAX_AGE_DAYS * 86_400_000;
   const fresh = pool.filter((item) => !item.publishedAt || Date.parse(item.publishedAt) >= cutoff);
-  const visible = (fresh.length >= 5 ? fresh : pool).slice(0, 14);
+  const visible = [...ndmaItems, ...(fresh.length >= 5 ? fresh : pool)].slice(0, 14);
 
   // Every upstream failed: surface the error instead of pretending there is no news.
   if (fulfilled.length === 0) {
