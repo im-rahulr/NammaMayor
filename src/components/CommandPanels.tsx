@@ -1,5 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 
+import { getNews } from "@/lib/news";
+import { Dialog, DialogContent } from "@/components/ui/dialog";
+import type { NewsItem } from "@/lib/news-rss";
+
 type Feed = { t: string; agent: string; msg: string; tone: "sys" | "agent" | "warn" | "ok" };
 type Props = {
   feed: Feed[];
@@ -49,6 +53,21 @@ const CONVO: [string, string, string][] = [
 
 type Msg = { t: string; from: string; to: string; text: string };
 type Log = { t: string; level: "INFO" | "WARN" | "OK"; text: string };
+type NewsState = { items: NewsItem[]; sources: string[]; updatedAt: string | null; loading: boolean; error: string | null };
+
+const NEWS_REFRESH_MS = 60_000;
+
+const ago = (iso: string | null) => {
+  if (!iso) return "";
+  const mins = Math.max(0, Math.round((Date.now() - Date.parse(iso)) / 60_000));
+  if (mins < 1) return "now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+};
+
+const isBreaking = (iso: string | null) => !!iso && Date.now() - Date.parse(iso) < 3 * 60 * 60 * 1000;
 
 export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -56,6 +75,33 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
   const [i, setI] = useState(0);
   const [paused, setPaused] = useState(false);
   const chatEnd = useRef<HTMLDivElement>(null);
+  const [cctvOpen, setCctvOpen] = useState(false);
+  const [news, setNews] = useState<NewsState>({ items: [], sources: [], updatedAt: null, loading: true, error: null });
+  const [newsSource, setNewsSource] = useState<string | null>(null);
+  const [newsNonce, setNewsNonce] = useState(0);
+
+  // Real headlines from Google News RSS, fetched through a server function (no CORS in the browser).
+  useEffect(() => {
+    let cancelled = false;
+    setNews((s) => ({ ...s, loading: true }));
+    getNews({ data: { mode } })
+      .then((payload) => {
+        if (cancelled) return;
+        setNews({ items: payload.items, sources: payload.sources, updatedAt: payload.updatedAt, loading: false, error: null });
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        setNews((s) => ({ ...s, loading: false, error: err instanceof Error ? err.message : "News feed unavailable" }));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, newsNonce]);
+
+  useEffect(() => {
+    const id = setInterval(() => setNewsNonce((n) => n + 1), NEWS_REFRESH_MS);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     if (paused) return;
@@ -84,6 +130,7 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
   const watched = [...zones].sort((a, b) => (depth[b.id] ?? 0) - (depth[a.id] ?? 0));
   const color = (id: string) => AGENTS.find((a) => a.id === id)?.color ?? "text-foreground";
   const warns = logs.filter((l) => l.level === "WARN").length;
+  const visibleNews = newsSource ? news.items.filter((n) => n.source === newsSource) : news.items;
 
   return (
     <div className="space-y-3 p-3">
@@ -104,19 +151,66 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
             </div>
           ))}
         </Panel>
-        <Panel title="LIVE NEWS" className="xl:col-span-1">
+        <Panel title="LIVE NEWS" count={news.items.length} className="xl:col-span-1">
           <div className="mb-3 flex flex-wrap gap-1">
-            {["TV9 KANNADA", "PUBLIC TV", "NDTV", "THE HINDU", "DECCAN HERALD"].map((c, k) => (
-              <span key={c} className={`rounded-sm border px-2 py-1 text-[10px] ${k === 0 ? "border-destructive bg-destructive text-destructive-foreground" : ""}`}>{c}</span>
+            <button
+              onClick={() => setNewsSource(null)}
+              className={`rounded-sm border px-2 py-1 text-[10px] ${newsSource === null ? "border-destructive bg-destructive text-destructive-foreground" : ""}`}
+            >
+              ALL
+            </button>
+            {news.sources.map((c) => (
+              <button
+                key={c}
+                onClick={() => setNewsSource(newsSource === c ? null : c)}
+                className={`rounded-sm border px-2 py-1 text-[10px] ${newsSource === c ? "border-destructive bg-destructive text-destructive-foreground" : ""}`}
+              >
+                {c.toUpperCase()}
+              </button>
             ))}
           </div>
-          {(live ? [
-            mode === "gas" ? "Gas leak reported near HSR Sector 2, area cordoned" : "Heavy rain lashes south Bengaluru, Silk Board flooded",
-            "BBMP control room activated, citizens told to avoid ORR",
-            "BMTC diverts buses; relief camps opened",
-          ] : ["City calm. No major incidents reported.", "IMD: light showers expected this evening"]).map((n) => (
-            <div key={n} className="mb-2 border-b pb-2">● {n}</div>
-          ))}
+
+          {news.error && news.items.length === 0 ? (
+            <div className="space-y-2">
+              <p className="text-muted-foreground">News feed offline — {news.error}</p>
+              <button onClick={() => setNewsNonce((n) => n + 1)} className="rounded-sm border px-2 py-1 text-[10px]">↻ RETRY</button>
+            </div>
+          ) : news.loading && news.items.length === 0 ? (
+            <div className="space-y-2">
+              {[0, 1, 2, 3].map((k) => <div key={k} className="h-9 animate-pulse rounded-sm bg-muted" />)}
+            </div>
+          ) : visibleNews.length === 0 ? (
+            <p className="text-muted-foreground">No headlines for this filter right now.</p>
+          ) : (
+            visibleNews.map((n) => (
+              <a
+                key={n.id}
+                href={n.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="mb-2 block border-b pb-2 last:border-0 hover:text-accent"
+              >
+                <div className="flex gap-1.5">
+                  <span className={isBreaking(n.publishedAt) ? "text-destructive" : "text-accent"}>●</span>
+                  <span className="line-clamp-2">{n.title}</span>
+                </div>
+                <div className="mt-1 pl-3.5 text-[10px] text-muted-foreground">
+                  {n.source}
+                  {n.publishedAt ? ` · ${ago(n.publishedAt)}` : ""}
+                </div>
+              </a>
+            ))
+          )}
+
+          <div className="sticky bottom-0 -mx-4 -mb-4 mt-1 flex items-center justify-between border-t bg-card/95 px-4 py-2 text-[10px] text-muted-foreground backdrop-blur">
+            <span>
+              {news.updatedAt
+                ? `UPDATED ${new Date(news.updatedAt).toLocaleTimeString("en-GB", { hour12: false })}`
+                : "CONNECTING…"}
+              {news.loading && news.items.length > 0 ? " · REFRESHING" : ""}
+            </span>
+            <button onClick={() => setNewsNonce((n) => n + 1)} className="tracking-widest hover:text-accent">↻ REFRESH</button>
+          </div>
         </Panel>
         <Panel title="SAVED PLACES" count={2}>
           {["BBMP HQ · Hudson Circle", "Control Room · Koramangala"].map((p) => (
@@ -127,13 +221,29 @@ export function CommandPanels({ feed, depth, zones, live, mode }: Props) {
 
       <div className="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-4">
         <Panel title="LIVE WEBCAMS" className="h-64 xl:col-span-2">
-          <div className="grid grid-cols-3 gap-2">
-            {["Silk Board", "HSR 27th Main", "Bellandur ORR", "Koramangala 80ft", "BTM 2nd Stage", "Sarjapur Jn"].map((c) => (
-              <div key={c} className="relative flex h-20 items-end rounded-sm border bg-background p-1 text-[10px]">
-                <span className="absolute right-1 top-1 h-1.5 w-1.5 rounded-full bg-destructive pulse-ring" />{c}
-              </div>
-            ))}
+          <div
+            className="mt-2 h-[calc(100%-0.5rem)] min-h-[150px] cursor-pointer"
+            onClick={() => setCctvOpen(true)}
+            title="Click to expand"
+          >
+            <iframe
+              src="https://webcams.windy.com/webcams/public/embed/player/1793900066/day?autoPlay=1&loop=1&interactive=false"
+              className="pointer-events-none h-full w-full rounded-sm border"
+              allow="autoplay; fullscreen"
+              title="Live CCTV — Bengaluru West: Dodda Banaswadi"
+            />
           </div>
+          <Dialog open={cctvOpen} onOpenChange={setCctvOpen}>
+            <DialogContent className="h-[90vh] w-[95vw] max-w-none p-0">
+              <iframe
+                src="https://webcams.windy.com/webcams/public/embed/player/1793900066/day?autoPlay=1&loop=1&interactive=false"
+                className="h-full w-full rounded-sm border-0"
+                allow="autoplay; fullscreen"
+                allowFullScreen
+                title="Live CCTV — Bengaluru West: Dodda Banaswadi"
+              />
+            </DialogContent>
+          </Dialog>
         </Panel>
         <Panel title="WATCHED LOCATIONS" count={watched.length} className="h-64">
           {watched.map((z) => (
