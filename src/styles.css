@@ -102,6 +102,29 @@
   /* Dark-mode look: invert brightness/hue so OSM tiles match the dark UI */
   filter: invert(1) hue-rotate(180deg) brightness(0.85) contrast(0.9) saturate(0.8);
 }
+
+.dark-tiles-deep {
+  /* Nearly-black cartographic look for the route engine (maps-@night style) */
+  filter: invert(1) hue-rotate(180deg) brightness(0.42) contrast(1.15) saturate(0.5);
+}
+
+@keyframes route-pin-pop {
+  0% {
+    transform: scale(0.35);
+    opacity: 0;
+  }
+  70% {
+    transform: scale(1.18);
+    opacity: 1;
+  }
+  100% {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+.route-pin-pop {
+  animation: route-pin-pop 0.5s cubic-bezier(0.2, 1.4, 0.4, 1) both;
+}
 .leaflet-container {
   background: var(--color-background);
 }

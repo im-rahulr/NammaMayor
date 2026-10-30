@@ -11,6 +11,8 @@
 import { Route as rootRouteImport } from './routes/__root'
 import { Route as IndexRouteImport } from './routes/index'
 import { Route as CommandRouteImport } from './routes/command'
+import { Route as EventsRouteImport } from './routes/events'
+import { Route as RoutesRouteImport } from './routes/routes'
 
 const IndexRoute = IndexRouteImport.update({
   id: '/',
@@ -22,31 +24,49 @@ const CommandRoute = CommandRouteImport.update({
   path: '/command',
   getParentRoute: () => rootRouteImport,
 } as any)
+const EventsRoute = EventsRouteImport.update({
+  id: '/events',
+  path: '/events',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const RoutesRoute = RoutesRouteImport.update({
+  id: '/routes',
+  path: '/routes',
+  getParentRoute: () => rootRouteImport,
+} as any)
 
 export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/command': typeof CommandRoute
+  '/events': typeof EventsRoute
+  '/routes': typeof RoutesRoute
 }
 export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/command': typeof CommandRoute
+  '/events': typeof EventsRoute
+  '/routes': typeof RoutesRoute
 }
 export interface FileRoutesById {
   __root__: typeof rootRouteImport
   '/': typeof IndexRoute
   '/command': typeof CommandRoute
+  '/events': typeof EventsRoute
+  '/routes': typeof RoutesRoute
 }
 export interface FileRouteTypes {
   fileRoutesByFullPath: FileRoutesByFullPath
-  fullPaths: '/' | '/command'
+  fullPaths: '/' | '/command' | '/events' | '/routes'
   fileRoutesByTo: FileRoutesByTo
-  to: '/' | '/command'
-  id: '__root__' | '/' | '/command'
+  to: '/' | '/command' | '/events' | '/routes'
+  id: '__root__' | '/' | '/command' | '/events' | '/routes'
   fileRoutesById: FileRoutesById
 }
 export interface RootRouteChildren {
   IndexRoute: typeof IndexRoute
   CommandRoute: typeof CommandRoute
+  EventsRoute: typeof EventsRoute
+  RoutesRoute: typeof RoutesRoute
 }
 
 declare module '@tanstack/react-router' {
@@ -65,12 +85,28 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof CommandRouteImport
       parentRoute: typeof rootRouteImport
     }
+    '/events': {
+      id: '/events'
+      path: '/events'
+      fullPath: '/events'
+      preLoaderRoute: typeof EventsRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/routes': {
+      id: '/routes'
+      path: '/routes'
+      fullPath: '/routes'
+      preLoaderRoute: typeof RoutesRouteImport
+      parentRoute: typeof rootRouteImport
+    }
   }
 }
 
 const rootRouteChildren: RootRouteChildren = {
   IndexRoute: IndexRoute,
   CommandRoute: CommandRoute,
+  EventsRoute: EventsRoute,
+  RoutesRoute: RoutesRoute,
 }
 export const routeTree = rootRouteImport
   ._addFileChildren(rootRouteChildren)
